@@ -4,18 +4,22 @@
 - 维护跨帧 track
 - 关联策略固定为：IOU 优先，中心点距离兜底，否则新建 track
 - 支持 max_lost_frames / min_track_frames
+- 支持轻量运动过滤（仅用于 confirmed 之前）
+- 支持 confirmed+entered_core 轨迹的短暂保活重连
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import sqrt
-from typing import Dict, List, Tuple
+from typing import Dict, List, Literal, Tuple
 
 from detector import Detection
 
 
 BBox = Tuple[float, float, float, float]
+ROI = Tuple[int, int, int, int]
+Direction = Literal["left_to_right", "right_to_left"]
 
 
 @dataclass
@@ -27,7 +31,8 @@ class Track:
     last_frame_idx: int
     lost_frames: int = 0
     hit_frames: int = 1
-    # 用于短时运动连续性：保存最近 bbox 历史
+    confirmed: bool = False
+    entered_core: bool = False
     history: List[Tuple[int, BBox]] = field(default_factory=list)
 
 
@@ -41,45 +46,59 @@ class TrackAssignment:
 
 
 class MinimalTracker:
-    """MVP 追踪器。
+    """MVP 追踪器。"""
 
-    关联规则（固定）：
-    1) 优先 IOU 关联
-    2) IOU 不满足时，使用中心点距离兜底
-    3) 两者都不满足时，创建新 track
-    """
-
-    def __init__(self, iou_threshold: float, max_center_distance_px: float, max_lost_frames: int, min_track_frames: int) -> None:
+    def __init__(
+        self,
+        iou_threshold: float,
+        max_center_distance_px: float,
+        max_lost_frames: int,
+        min_track_frames: int,
+        motion_min_frames: int,
+        motion_min_distance_px: float,
+        direction: Direction,
+        direction_min_progress_px: float,
+        core_roi: ROI,
+        core_reacquire_max_frames: int,
+        core_reacquire_max_dist_px: float,
+    ) -> None:
         self.iou_threshold = iou_threshold
         self.max_center_distance_px = max_center_distance_px
         self.max_lost_frames = max_lost_frames
         self.min_track_frames = min_track_frames
 
+        self.motion_min_frames = motion_min_frames
+        self.motion_min_distance_px = motion_min_distance_px
+        self.direction = direction
+        self.direction_min_progress_px = direction_min_progress_px
+
+        self.core_roi = core_roi
+        self.core_reacquire_max_frames = core_reacquire_max_frames
+        self.core_reacquire_max_dist_px = core_reacquire_max_dist_px
+
         self.tracks: Dict[int, Track] = {}
         self.next_track_id = 1
 
     def update(self, detections: List[Detection], frame_idx: int) -> List[TrackAssignment]:
-        """输入当前帧检测结果，输出当前帧检测对应的 track 分配。"""
-        # 先将已有轨迹标记为“本帧暂未匹配”
         for track in self.tracks.values():
             track.lost_frames += 1
 
-        assignments: Dict[int, int] = {}  # det_idx -> track_id
+        assignments: Dict[int, int] = {}
         matched_track_ids = set()
 
-        active_track_ids = [tid for tid, t in self.tracks.items() if t.lost_frames <= self.max_lost_frames]
+        active_track_ids = [tid for tid, t in self.tracks.items() if self._within_keepalive(t)]
         unmatched_det_idxs = list(range(len(detections)))
 
-        # 阶段1：IOU 优先匹配（贪心）
-        iou_candidates: List[Tuple[float, int, int]] = []  # (iou, tid, det_idx)
+        # 1) IOU 优先
+        iou_candidates: List[Tuple[float, int, int]] = []
         for tid in active_track_ids:
             track = self.tracks[tid]
             for det_idx in unmatched_det_idxs:
                 iou = bbox_iou(track.bbox_xyxy, detections[det_idx].bbox_xyxy)
                 if iou >= self.iou_threshold:
                     iou_candidates.append((iou, tid, det_idx))
-
         iou_candidates.sort(key=lambda x: x[0], reverse=True)
+
         used_dets = set()
         for _, tid, det_idx in iou_candidates:
             if tid in matched_track_ids or det_idx in used_dets:
@@ -91,17 +110,19 @@ class MinimalTracker:
 
         unmatched_det_idxs = [i for i in unmatched_det_idxs if i not in used_dets]
 
-        # 阶段2：中心点距离兜底（带短时运动连续性）
-        dist_candidates: List[Tuple[float, int, int]] = []  # (distance, tid, det_idx)
+        # 2) 距离兜底（对 core 保活轨迹放宽丢失窗口但保持合理重连距离）
+        dist_candidates: List[Tuple[float, int, int]] = []
         candidate_track_ids = [tid for tid in active_track_ids if tid not in matched_track_ids]
-
         for tid in candidate_track_ids:
             track = self.tracks[tid]
-            predicted_bbox = self._predict_bbox(track)
+            pred_bbox = self._predict_bbox(track)
+            max_dist = self.core_reacquire_max_dist_px if (track.confirmed and track.entered_core) else self.max_center_distance_px
             for det_idx in unmatched_det_idxs:
-                dist = center_distance(predicted_bbox, detections[det_idx].bbox_xyxy)
-                if dist <= self.max_center_distance_px:
-                    dist_candidates.append((dist, tid, det_idx))
+                dist = center_distance(pred_bbox, detections[det_idx].bbox_xyxy)
+                if dist <= max_dist:
+                    # 优先 core 保活轨迹重连：轻微减去权重
+                    priority_bias = -5.0 if (track.confirmed and track.entered_core) else 0.0
+                    dist_candidates.append((dist + priority_bias, tid, det_idx))
 
         dist_candidates.sort(key=lambda x: x[0])
         used_dets = set()
@@ -115,24 +136,28 @@ class MinimalTracker:
 
         unmatched_det_idxs = [i for i in unmatched_det_idxs if i not in used_dets]
 
-        # 阶段3：未匹配 detection 新建轨迹
+        # 3) 新建轨迹
         for det_idx in unmatched_det_idxs:
             tid = self._create_track(detections[det_idx], frame_idx)
             assignments[det_idx] = tid
 
-        # 清理丢失过久轨迹
-        to_remove = [tid for tid, track in self.tracks.items() if track.lost_frames > self.max_lost_frames]
+        # 清理过久未匹配轨迹（core保活只对 confirmed+entered_core 生效）
+        to_remove = [tid for tid, track in self.tracks.items() if not self._within_keepalive(track)]
         for tid in to_remove:
             del self.tracks[tid]
 
-        # 按输入 detection 顺序返回 track_id
         results: List[TrackAssignment] = []
         for det_idx, det in enumerate(detections):
             tid = assignments[det_idx]
             track = self.tracks.get(tid)
-            confirmed = bool(track and track.hit_frames >= self.min_track_frames)
+            confirmed = bool(track and track.confirmed)
             results.append(TrackAssignment(detection=det, track_id=tid, confirmed=confirmed))
         return results
+
+    def _within_keepalive(self, track: Track) -> bool:
+        if track.confirmed and track.entered_core:
+            return track.lost_frames <= self.core_reacquire_max_frames
+        return track.lost_frames <= self.max_lost_frames
 
     def _create_track(self, detection: Detection, frame_idx: int) -> int:
         tid = self.next_track_id
@@ -143,6 +168,8 @@ class MinimalTracker:
             last_frame_idx=frame_idx,
             lost_frames=0,
             hit_frames=1,
+            confirmed=False,
+            entered_core=False,
             history=[(frame_idx, detection.bbox_xyxy)],
         )
         return tid
@@ -154,16 +181,38 @@ class MinimalTracker:
         track.lost_frames = 0
         track.hit_frames += 1
         track.history.append((frame_idx, detection.bbox_xyxy))
-        # 仅保留短历史，足够支持短时运动连续性
-        if len(track.history) > 5:
-            track.history = track.history[-5:]
+        if len(track.history) > 8:
+            track.history = track.history[-8:]
+
+        # 进入 core 标记（仅对已匹配轨迹更新）
+        cx, cy = bbox_center(track.bbox_xyxy)
+        if point_in_roi(cx, cy, self.core_roi):
+            track.entered_core = True
+
+        # 轻量运动过滤仅用于升级 confirmed 前
+        if not track.confirmed:
+            if track.hit_frames >= self.min_track_frames and self._motion_ok(track):
+                track.confirmed = True
+
+    def _motion_ok(self, track: Track) -> bool:
+        if len(track.history) < self.motion_min_frames:
+            return False
+        window = track.history[-self.motion_min_frames :]
+        start_cx, start_cy = bbox_center(window[0][1])
+        end_cx, end_cy = bbox_center(window[-1][1])
+        dx = end_cx - start_cx
+        dy = end_cy - start_cy
+        dist = sqrt(dx * dx + dy * dy)
+        if dist < self.motion_min_distance_px:
+            return False
+
+        if self.direction == "left_to_right" and dx < self.direction_min_progress_px:
+            return False
+        if self.direction == "right_to_left" and dx > -self.direction_min_progress_px:
+            return False
+        return True
 
     def _predict_bbox(self, track: Track) -> BBox:
-        """根据短历史做极简运动连续性预测。
-
-        - 若历史不足 2 帧，直接用当前 bbox
-        - 若历史 >=2，基于中心点速度做一步外推，再保持 bbox 尺寸
-        """
         if len(track.history) < 2:
             return track.bbox_xyxy
 
@@ -183,7 +232,6 @@ class MinimalTracker:
 
 
 def bbox_iou(a: BBox, b: BBox) -> float:
-    """计算两个 bbox 的 IOU。"""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
 
@@ -210,7 +258,11 @@ def bbox_center(bbox_xyxy: BBox) -> Tuple[float, float]:
 
 
 def center_distance(a: BBox, b: BBox) -> float:
-    """计算两个 bbox 中心点欧氏距离。"""
     acx, acy = bbox_center(a)
     bcx, bcy = bbox_center(b)
     return sqrt((acx - bcx) ** 2 + (acy - bcy) ** 2)
+
+
+def point_in_roi(x: float, y: float, roi: ROI) -> bool:
+    rx, ry, rw, rh = roi
+    return rw > 0 and rh > 0 and rx <= x <= rx + rw and ry <= y <= ry + rh

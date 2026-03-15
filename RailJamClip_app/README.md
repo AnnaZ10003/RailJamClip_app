@@ -15,11 +15,12 @@
 2. 使用 Ultralytics YOLO 对视频逐帧或按步长执行检测
 3. 仅保留 `person` 类检测框
 4. 基于 IOU 优先 + 中心点距离兜底 + 短时连续性实现最小 tracking
-5. 使用 `tracking_roi`（由 entry/core/exit 外包矩形+margin 自动生成）过滤背景人物
-6. 使用最小 bbox 尺寸过滤减少小目标噪声
-7. 输出检测+tracking 调试 JSON（每帧 person 框与 track_id）
-8. 输出 tracking 调试预览视频（bbox/track_id/confirmed + ROI）
-9. 输出符合 required 模板的 `metadata.json`（当前 `events` 为空）
+5. 使用 `active_frame_roi` 排除两侧黑边干扰
+6. 使用 `tracking_roi`（由 entry/core/exit 外包矩形+margin 自动生成）过滤背景人物
+7. 使用最小 bbox 尺寸过滤减少小目标噪声
+8. 输出检测+tracking 调试 JSON（每帧 person 框与 track_id）
+9. 输出 tracking 调试预览视频（bbox/track_id/confirmed + ROI）
+10. 输出符合 required 模板的 `metadata.json`（当前 `events` 为空）
 
 尚未实现（后续）：
 - entry/core/exit 状态机
@@ -46,12 +47,12 @@ python main.py --config config.yaml
 - `output/clips/` 与 `logs/` 目录会被创建
 
 ## 配置重点
-- `detector.frame_step`：检测/追踪步长（默认 `2`，更适合 CPU 测试）
-- `detector.imgsz`：YOLO 推理尺寸，默认 `640`（CPU 推荐起步值）
-- `tracking.use_tracking_roi`：是否启用走廊 ROI 过滤
-- `tracking.tracking_roi_margin_px`：自动生成走廊 ROI 的外扩边距
+- `roi.active_frame_roi`：有效画面区域（先裁剪到视频边界；预览画的是裁剪后结果）
+- `roi.entry_roi/core_roi/exit_roi`：第一版使用整帧坐标配置，再裁剪到 `active_frame_roi` 内
+- `tracking.tracking_roi_margin_px`：自动生成走廊 ROI 外扩边距（在 active_frame_roi 内截断）
 - `tracking.min_bbox_width_px/min_bbox_height_px/min_bbox_area_px`：进入 tracking 的最小框过滤
-- `tracking.min_roi_width_px/min_roi_height_px/min_roi_area_ratio`：ROI 裁剪后过小告警阈值
-- `debug.export_preview_video`：是否导出预览视频
-- `debug.preview_video_path`：预览视频输出路径
-- ROI 会在加载后自动裁剪到画面边界；若被裁剪或过小会输出 warning
+- `tracking.min_motion_frames/min_motion_distance_px/direction_min_progress_px`：仅用于候选轨迹升级 confirmed 前的运动过滤
+- `tracking.core_reacquire_max_frames/core_reacquire_max_dist_px`：仅对 confirmed 且 entered_core 的丢失轨迹保活重连
+- `detector.frame_step`：检测/追踪步长（默认 `2`，更适合 CPU 测试）
+- `detector.imgsz`：YOLO 推理尺寸，默认 `640`
+- ROI 会在加载后自动裁剪到边界；若被裁剪或过小会输出 warning
