@@ -26,10 +26,10 @@ detector:
   device: "cpu"                # "cpu" | "cuda:0"
   conf_threshold: 0.35
   iou_threshold: 0.50
-  imgsz: 640                # CPU 推荐先用 640，必要时可再降
+  imgsz: 640                     # CPU 推荐先用 640，必要时可再降
   person_class_id: 0
   max_det: 20
-  frame_step: 2                 # 默认2，更适合CPU测试；1=逐帧
+  frame_step: 2                  # 默认2，更适合CPU测试；1=逐帧
 
 tracking:
   enabled: true
@@ -40,11 +40,26 @@ tracking:
   max_lost_frames: 8
   min_track_frames: 6
 
+  # 走廊 tracking ROI：第一版由 entry/core/exit 外包矩形 + margin 自动生成
+  use_tracking_roi: true
+  tracking_roi_margin_px: 80
+
+  # 检测框最小尺寸过滤（小框不进 tracking）
+  min_bbox_width_px: 18
+  min_bbox_height_px: 24
+  min_bbox_area_px: 500
+
+  # ROI clipping 后过小告警阈值
+  min_roi_width_px: 24
+  min_roi_height_px: 24
+  min_roi_area_ratio: 0.001
+
 roi:
   # entry/core/exit 永远表示事件顺序语义，不受 direction 改写
   entry_roi: { x: 480, y: 260, w: 160, h: 200 }
   core_roi:  { x: 650, y: 250, w: 220, h: 220 }
-  exit_roi:  { x: 900, y: 260, w: 160, h: 200 }
+  # 建议 exit_roi 贴近画面边界做窄区域，不要大块延伸到画外
+  exit_roi:  { x: 1080, y: 260, w: 120, h: 180 }
 
 event:
   # direction 仅用于 x 方向一致性过滤
