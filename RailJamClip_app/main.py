@@ -319,6 +319,10 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
 
     center_offset_max_ratio = float(auto_cfg.get("center_offset_max_ratio", 0.10))
     symmetry_tolerance_ratio = float(auto_cfg.get("symmetry_tolerance_ratio", 0.28))
+    min_density_ratio = float(auto_cfg.get("min_density_ratio", 0.015))
+    min_run_width_ratio = float(auto_cfg.get("min_continuous_width_ratio", 0.40))
+    edge_inset_px = int(auto_cfg.get("edge_inset_px", 8))
+    edge_inset_max_px = int(auto_cfg.get("edge_inset_max_px", 24))
 
     dyn_w_ratio = float(auto_cfg.get("dynamic_default_width_ratio", 0.74))
     dyn_side_ratio = float(auto_cfg.get("dynamic_default_side_margin_ratio", 0.12))
@@ -358,6 +362,16 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                 (non_black_ratio[j] >= min_non_black_ratio)
                 and (local_variance[j] >= min_local_variance)
                 and (edge_density[j] >= min_edge_density)
+                continue
+            sampled += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            col_mean = gray.mean(axis=0)
+            non_black_ratio = (gray > black_th).mean(axis=0)
+            col_std = gray.std(axis=0)
+            dense_ratio = (col_std > 4.0).astype(float)
+            valid_flags = [
+                (non_black_ratio[j] >= min_non_black_ratio)
+                and ((col_mean[j] >= black_th + 3.0) or (dense_ratio[j] >= min_density_ratio))
                 for j in range(gray.shape[1])
             ]
             seg = _longest_true_segment(valid_flags)
@@ -400,6 +414,18 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                     "segment_width": int(r2 - l2 + 1),
                     "min_width_check_passed": True,
                 })
+                continue
+            l, r = seg
+            if (r - l + 1) < int(width * min_run_width_ratio):
+                continue
+
+            inset = min(edge_inset_px, edge_inset_max_px, max(0, (r - l + 1) // 8))
+            l2, r2 = l + inset, r - inset
+            if r2 <= l2:
+                continue
+            lefts.append(l2)
+            rights.append(r2)
+            widths.append(r2 - l2 + 1)
     cap.release()
 
     warnings: List[str] = []
@@ -408,6 +434,8 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     if widths:
         left = int(_quantile([float(x) for x in lefts], left_q, median(lefts)))
         right = int(_quantile([float(x) for x in rights], right_q, median(rights)))
+        left = int(_quantile([float(x) for x in lefts], 0.75, median(lefts)))
+        right = int(_quantile([float(x) for x in rights], 0.25, median(rights)))
         raw = (left, 0, max(0, right - left + 1), height)
         ratio = raw[2] / max(1, width)
         jitter = float(max(widths) - min(widths)) if widths else 0.0
@@ -634,6 +662,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         "mode": "auto",
         "reliable": False,
         "auto_inference": {"status": status, "value": None},
+        "auto_inference": {"status": "unstable" if active_unstable else "failed", "value": None},
         "final": {"value": final_value, "source": final_source},
         "fallback_chain": chain,
         "warnings": warnings,
