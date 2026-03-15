@@ -25,7 +25,7 @@ detector:
   imgsz: 640                # CPU 推荐先用 640，必要时可再降
   person_class_id: 0
   max_det: 20
-  frame_step: 1                 # 1=逐帧；2=每2帧检测一次
+  frame_step: 2                 # 默认2，更适合CPU测试；1=逐帧
 
 tracking:
   enabled: true
