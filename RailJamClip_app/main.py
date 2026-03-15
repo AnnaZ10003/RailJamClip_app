@@ -264,6 +264,43 @@ def _template_match_check(template: Optional[Dict[str, Any]], width: int, height
     }
 
 
+def _longest_true_segment(flags: List[bool]) -> Optional[Tuple[int, int]]:
+    best: Optional[Tuple[int, int]] = None
+    start = -1
+    for i, v in enumerate(flags):
+        if v and start < 0:
+            start = i
+        if (not v or i == len(flags) - 1) and start >= 0:
+            end = i if v and i == len(flags) - 1 else i - 1
+            if end >= start and (best is None or (end - start) > (best[1] - best[0])):
+                best = (start, end)
+            start = -1
+    return best
+
+
+def _build_track_features(assignments: List[TrackAssignment]) -> Dict[int, Dict[str, float]]:
+    feats: Dict[int, Dict[str, float]] = {}
+    for a in assignments:
+        x1, y1, x2, y2 = a.detection.bbox_xyxy
+        w = max(0.0, x2 - x1)
+        h = max(0.0, y2 - y1)
+        area = w * h
+        cx, cy = _bbox_center(a.detection.bbox_xyxy)
+        f = feats.setdefault(a.track_id, {
+            "points": [],
+            "areas": [],
+            "heights": [],
+            "center_x": [],
+            "center_y": [],
+        })
+        f["points"].append((cx, cy))
+        f["areas"].append(area)
+        f["heights"].append(h)
+        f["center_x"].append(cx)
+        f["center_y"].append(cy)
+    return feats
+
+
 def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg: Dict[str, Any], template: Optional[Dict[str, Any]], template_match: Dict[str, Any]) -> Dict[str, Any]:
     auto_cfg = cfg.get("calibration", {}).get("active_frame_auto", {})
     sample_frames = int(auto_cfg.get("sample_frames", 40))
@@ -271,6 +308,11 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     min_ratio = float(auto_cfg.get("min_content_width_ratio", 0.45))
     max_ratio = float(auto_cfg.get("max_content_width_ratio", 0.98))
     max_jitter = float(auto_cfg.get("max_width_jitter_px", 40))
+    min_non_black_ratio = float(auto_cfg.get("min_non_black_ratio", 0.06))
+    min_density_ratio = float(auto_cfg.get("min_density_ratio", 0.015))
+    min_run_width_ratio = float(auto_cfg.get("min_continuous_width_ratio", 0.40))
+    edge_inset_px = int(auto_cfg.get("edge_inset_px", 8))
+    edge_inset_max_px = int(auto_cfg.get("edge_inset_max_px", 24))
 
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -278,6 +320,7 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     lefts: List[int] = []
     rights: List[int] = []
     widths: List[int] = []
+    sampled = 0
 
     if cap.isOpened() and total > 0:
         n = max(1, sample_frames)
@@ -287,36 +330,54 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
             ret, frame = cap.read()
             if not ret:
                 continue
+            sampled += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            h = max(1, gray.shape[0])
             col_mean = gray.mean(axis=0)
-            valid_cols = [j for j, v in enumerate(col_mean) if v > black_th]
-            if not valid_cols:
+            non_black_ratio = (gray > black_th).mean(axis=0)
+            col_std = gray.std(axis=0)
+            dense_ratio = (col_std > 4.0).astype(float)
+            valid_flags = [
+                (non_black_ratio[j] >= min_non_black_ratio)
+                and ((col_mean[j] >= black_th + 3.0) or (dense_ratio[j] >= min_density_ratio))
+                for j in range(gray.shape[1])
+            ]
+            seg = _longest_true_segment(valid_flags)
+            if seg is None:
                 continue
-            l, r = min(valid_cols), max(valid_cols)
-            lefts.append(l)
-            rights.append(r)
-            widths.append(r - l + 1)
+            l, r = seg
+            if (r - l + 1) < int(width * min_run_width_ratio):
+                continue
+
+            inset = min(edge_inset_px, edge_inset_max_px, max(0, (r - l + 1) // 8))
+            l2, r2 = l + inset, r - inset
+            if r2 <= l2:
+                continue
+            lefts.append(l2)
+            rights.append(r2)
+            widths.append(r2 - l2 + 1)
     cap.release()
 
     warnings: List[str] = []
     validity = "ok"
-    fallback_used = False
-    fallback_source = "none"
 
     if not widths:
-        validity = "failed"
+        validity = "failed_no_valid_segments"
     else:
-        left = int(median(lefts))
-        right = int(median(rights))
+        left = int(_quantile([float(x) for x in lefts], 0.75, median(lefts)))
+        right = int(_quantile([float(x) for x in rights], 0.25, median(rights)))
         raw = (left, 0, max(0, right - left + 1), height)
         ratio = raw[2] / max(1, width)
         jitter = float(max(widths) - min(widths)) if widths else 0.0
+        pass_ratio = len(widths) / max(1, sampled)
         if ratio < min_ratio:
             validity = "too_narrow"
         elif ratio > max_ratio:
             validity = "too_wide"
         elif jitter > max_jitter:
-            validity = "unstable"
+            validity = "unstable_jitter"
+        elif pass_ratio < 0.4:
+            validity = "low_valid_frame_ratio"
         roi_raw = raw
         roi_clipped, _ = _clip_roi_to_bounds(roi_raw, width, height)
 
@@ -328,11 +389,17 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                 "fallback_used": False,
                 "fallback_source": "none",
                 "warnings": warnings,
+                "stats": {
+                    "sampled_frames": sampled,
+                    "valid_frames": len(widths),
+                    "valid_ratio": round(pass_ratio, 3),
+                    "width_jitter_px": round(jitter, 2),
+                    "edge_inset_px_applied": min(edge_inset_px, edge_inset_max_px),
+                },
             }
 
-    # fallback
-    fallback_used = True
     fallback_roi = None
+    fallback_source = "none"
     if template_match.get("matched") and template is not None:
         t_roi = template.get("rois", {}).get("active_frame_roi")
         if t_roi:
@@ -350,15 +417,21 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
         "roi_raw": _roi_to_cfg(fallback_roi),
         "roi_clipped": _roi_to_cfg(fallback_roi_clipped),
         "validity": validity,
-        "fallback_used": fallback_used,
+        "fallback_used": True,
         "fallback_source": fallback_source,
         "warnings": warnings,
+        "stats": {
+            "sampled_frames": sampled,
+            "valid_frames": len(widths),
+            "edge_inset_px_applied": min(edge_inset_px, edge_inset_max_px),
+        },
     }
 
 
-def _infer_direction_from_tracks(track_samples: Dict[int, List[Tuple[float, float]]], cfg: Dict[str, Any], template: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], active_roi: ROI, core_roi: ROI, cfg: Dict[str, Any], template: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     mode = cfg.get("template", {}).get("direction_mode", "auto")
     default_dir = cfg.get("event", {}).get("direction", "left_to_right")
+    dir_cfg = cfg.get("calibration", {}).get("direction_auto", {})
 
     if mode == "fixed":
         value = cfg.get("template", {}).get("direction_value") or default_dir
@@ -368,142 +441,255 @@ def _infer_direction_from_tracks(track_samples: Dict[int, List[Tuple[float, floa
             "final": {"value": value, "source": "fixed"},
             "fallback_chain": [{"step": 1, "source": "fixed", "result": "used", "value": value}],
             "warnings": [],
+            "explainability": {
+                "total_tracks": len(track_features),
+                "filtered_out_tracks": 0,
+                "voting_tracks": 0,
+                "left_to_right_score": 0.0,
+                "right_to_left_score": 0.0,
+                "final_confidence": 1.0,
+            },
         }
 
-    # auto mode
-    deltas: List[float] = []
-    for pts in track_samples.values():
-        if len(pts) < 2:
+    ax, ay, aw, ah = active_roi
+    cx, cy, cw, ch = core_roi
+    total_tracks = len(track_features)
+    candidates: List[Tuple[int, float, float]] = []
+
+    min_track_points = int(dir_cfg.get("min_track_points", 4))
+    min_move_px = float(dir_cfg.get("min_move_px", 40))
+    min_area = float(dir_cfg.get("min_bbox_area_px", 1400))
+    min_height = float(dir_cfg.get("min_bbox_height_px", 48))
+    min_bottom_ratio = float(dir_cfg.get("min_bottom_region_ratio", 0.50))
+    max_core_distance_ratio = float(dir_cfg.get("max_core_distance_ratio", 0.35))
+    min_consistency = float(dir_cfg.get("min_direction_consistency", 0.62))
+
+    for tid, feat in track_features.items():
+        pts = feat.get("points", [])
+        if len(pts) < min_track_points:
             continue
-        deltas.append(pts[-1][0] - pts[0][0])
+        areas = feat.get("areas", [])
+        heights = feat.get("heights", [])
+        if not areas or not heights:
+            continue
+        med_area = float(median(areas))
+        med_h = float(median(heights))
+        med_y = float(median([p[1] for p in pts]))
+        delta_x = float(pts[-1][0] - pts[0][0])
+        move_abs = abs(delta_x)
+
+        deltas = [pts[i + 1][0] - pts[i][0] for i in range(len(pts) - 1)]
+        if not deltas:
+            continue
+        pos = sum(1 for d in deltas if d > 0)
+        neg = sum(1 for d in deltas if d < 0)
+        consistency = max(pos, neg) / max(1, pos + neg)
+        core_dist_ratio = abs(float(median([p[0] for p in pts])) - (cx + cw / 2.0)) / max(1.0, aw)
+
+        if med_area < min_area:
+            continue
+        if med_h < min_height:
+            continue
+        if med_y < ay + ah * min_bottom_ratio:
+            continue
+        if core_dist_ratio > max_core_distance_ratio:
+            continue
+        if move_abs < min_move_px:
+            continue
+        if consistency < min_consistency:
+            continue
+
+        weight = (med_area / max(1.0, aw * ah)) * 2.0 + (move_abs / max(1.0, aw)) + (1.0 - core_dist_ratio)
+        candidates.append((tid, delta_x, max(0.01, weight)))
+
+    l2r_score = sum(w for _, dx, w in candidates if dx > 0)
+    r2l_score = sum(w for _, dx, w in candidates if dx < 0)
+    total_score = l2r_score + r2l_score
+    confidence = max(l2r_score, r2l_score) / max(1e-6, total_score) if total_score > 0 else 0.0
 
     chain = [{"step": 1, "source": "auto_inference", "result": "failed", "value": None}]
     warnings: List[str] = []
 
-    if len(deltas) >= 2:
-        pos = sum(1 for d in deltas if d > 0)
-        neg = sum(1 for d in deltas if d < 0)
-        total = max(1, pos + neg)
-        consistency = max(pos, neg) / total
-        if consistency >= 0.6:
-            inferred = "left_to_right" if pos >= neg else "right_to_left"
-            chain[0] = {"step": 1, "source": "auto_inference", "result": "used", "value": inferred}
-            return {
-                "mode": "auto",
-                "auto_inference": {"status": "ok", "value": inferred},
-                "final": {"value": inferred, "source": "auto"},
-                "fallback_chain": chain,
-                "warnings": warnings,
-            }
-
-    # fallback: template direction -> default
-    t_dir = None
-    if template is not None:
-        t_dir = template.get("direction", {}).get("direction_value")
-    if t_dir in ("left_to_right", "right_to_left"):
-        chain.append({"step": 2, "source": "template_direction", "result": "used", "value": t_dir})
-        warnings.append("Direction auto inference failed/unstable; fallback to template direction.")
+    if len(candidates) >= int(dir_cfg.get("min_voting_tracks", 2)) and total_score > 0 and confidence >= float(dir_cfg.get("min_final_confidence", 0.62)):
+        inferred = "left_to_right" if l2r_score >= r2l_score else "right_to_left"
+        chain[0] = {"step": 1, "source": "auto_inference", "result": "used", "value": inferred}
         return {
             "mode": "auto",
-            "auto_inference": {"status": "failed", "value": None},
-            "final": {"value": t_dir, "source": "template_direction"},
+            "auto_inference": {"status": "ok", "value": inferred},
+            "final": {"value": inferred, "source": "auto"},
             "fallback_chain": chain,
             "warnings": warnings,
+            "explainability": {
+                "total_tracks": total_tracks,
+                "filtered_out_tracks": max(0, total_tracks - len(candidates)),
+                "voting_tracks": len(candidates),
+                "left_to_right_score": round(l2r_score, 3),
+                "right_to_left_score": round(r2l_score, 3),
+                "final_confidence": round(confidence, 3),
+            },
         }
 
-    chain.append({"step": 2, "source": "template_direction", "result": "unavailable", "value": None})
-    chain.append({"step": 3, "source": "default_direction", "result": "used", "value": default_dir})
-    warnings.append("Direction auto inference failed/unstable; template direction unavailable; fallback to default direction.")
+    t_dir = template.get("direction", {}).get("direction_value") if template is not None else None
+    if t_dir in ("left_to_right", "right_to_left"):
+        chain.append({"step": 2, "source": "template_direction", "result": "used", "value": t_dir})
+        warnings.append("Direction auto inference unreliable; fallback to template direction.")
+        final_value = t_dir
+        final_source = "template_direction"
+    else:
+        chain.append({"step": 2, "source": "template_direction", "result": "unavailable", "value": None})
+        chain.append({"step": 3, "source": "default_direction", "result": "used", "value": default_dir})
+        warnings.append("Direction auto inference unreliable and template direction unavailable; fallback to default direction.")
+        final_value = default_dir
+        final_source = "default_direction"
+
     return {
         "mode": "auto",
         "auto_inference": {"status": "failed", "value": None},
-        "final": {"value": default_dir, "source": "default_direction"},
+        "final": {"value": final_value, "source": final_source},
         "fallback_chain": chain,
         "warnings": warnings,
+        "explainability": {
+            "total_tracks": total_tracks,
+            "filtered_out_tracks": max(0, total_tracks - len(candidates)),
+            "voting_tracks": len(candidates),
+            "left_to_right_score": round(l2r_score, 3),
+            "right_to_left_score": round(r2l_score, 3),
+            "final_confidence": round(confidence, 3),
+        },
     }
 
 
-def _suggest_rois_from_tracks(track_samples: Dict[int, List[Tuple[float, float]]], active_roi: ROI, direction: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _suggest_rois_from_tracks(track_features: Dict[int, Dict[str, Any]], active_roi: ROI, direction: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     rs_cfg = cfg.get("calibration", {}).get("roi_suggestion", {})
     min_valid_tracks = int(rs_cfg.get("min_valid_tracks", 3))
-    entry_ratio = rs_cfg.get("entry_ratio", [0.05, 0.25])
-    core_ratio = rs_cfg.get("core_ratio", [0.30, 0.70])
-    exit_ratio = rs_cfg.get("exit_ratio", [0.75, 0.95])
+
+    template_geo = rs_cfg.get("template_geometry", {})
+    entry_ratio = template_geo.get("entry_ratio", [0.06, 0.20])
+    core_ratio = template_geo.get("core_ratio", [0.34, 0.62])
+    exit_ratio = template_geo.get("exit_ratio", [0.78, 0.94])
+    max_core_width_ratio = float(template_geo.get("max_core_width_ratio", 0.45))
+    safe_border_margin_px = int(template_geo.get("safe_border_margin_px", 24))
+
+    adjust_cfg = rs_cfg.get("micro_adjust", {})
+    max_shift_px = int(adjust_cfg.get("max_shift_px", 36))
+    max_expand_ratio = float(adjust_cfg.get("max_expand_ratio", 0.12))
 
     guard = rs_cfg.get("min_size_guard", {})
     min_w = int(guard.get("min_roi_width_px", 80))
     min_h = int(guard.get("min_roi_height_px", 100))
 
-    points: List[Tuple[float, float]] = []
-    for pts in track_samples.values():
-        points.extend(pts)
+    vertical_cfg = rs_cfg.get("vertical_padding", {})
+    headroom_px = int(vertical_cfg.get("headroom_px", 50))
+    footroom_px = int(vertical_cfg.get("footroom_px", 35))
+    min_height_ratio = float(vertical_cfg.get("min_height_ratio", 0.38))
 
     ax, ay, aw, ah = active_roi
-
-    # fallback defaults from config if poor data
-    raw_roi_cfg = cfg.get("roi", {})
-    fallback_entry = _parse_roi(raw_roi_cfg, "entry_roi")
-    fallback_core = _parse_roi(raw_roi_cfg, "core_roi")
-    fallback_exit = _parse_roi(raw_roi_cfg, "exit_roi")
-
-    warnings: List[str] = []
-    if len(track_samples) < min_valid_tracks or len(points) < 20:
-        warnings.append("Insufficient track samples for robust ROI suggestion; fallback to configured stage ROIs clipped to active_frame_roi.")
-        e, _ = _clip_roi_to_parent(fallback_entry, active_roi)
-        c, _ = _clip_roi_to_parent(fallback_core, active_roi)
-        x, _ = _clip_roi_to_parent(fallback_exit, active_roi)
-        t = _build_tracking_roi([e, c, x], int(cfg.get("tracking", {}).get("tracking_roi_margin_px", 50)), active_roi)
-        return {
-            "result": {"entry_roi": _roi_to_cfg(e), "core_roi": _roi_to_cfg(c), "exit_roi": _roi_to_cfg(x), "tracking_roi": _roi_to_cfg(t)},
-            "scores": {
-                "overall_confidence_score": 0.4,
-                "track_count_score": min(1.0, len(track_samples) / max(1, min_valid_tracks)),
-                "direction_consistency_score": 0.4,
-                "path_compactness_score": 0.4,
-            },
-            "warnings": warnings,
-            "min_size_guard": {"min_roi_width_px": min_w, "min_roi_height_px": min_h},
-        }
-
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    y1 = int(_quantile(ys, 0.20, ay))
-    y2 = int(_quantile(ys, 0.80, ay + ah))
-    roi_h = max(min_h, y2 - y1)
 
     if direction == "right_to_left":
         entry_ratio, exit_ratio = exit_ratio, entry_ratio
 
-    def mk(seg: List[float]) -> ROI:
+    y_base = ay + int(ah * 0.38)
+    h_base = max(min_h, int(ah * min_height_ratio))
+
+    def mk(seg: List[float], max_w_ratio: Optional[float] = None) -> ROI:
         sx = int(ax + aw * seg[0])
         ex = int(ax + aw * seg[1])
         w = max(min_w, ex - sx)
-        roi = (sx, y1, w, roi_h)
+        if max_w_ratio is not None:
+            w = min(w, int(aw * max_w_ratio))
+        roi = (sx, y_base, w, h_base)
         clipped, _ = _clip_roi_to_parent(roi, active_roi)
         return clipped
 
     entry = mk(entry_ratio)
-    core = mk(core_ratio)
+    core = mk(core_ratio, max_core_width_ratio)
     exit_roi = mk(exit_ratio)
+
+    points: List[Tuple[float, float]] = []
+    for feat in track_features.values():
+        points.extend(feat.get("points", []))
+
+    warnings: List[str] = []
+    used_track_count = len([1 for feat in track_features.values() if len(feat.get("points", [])) >= 2])
+
+    if used_track_count >= min_valid_tracks and len(points) >= 20:
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        x_center = int(_quantile(xs, 0.50, ax + aw / 2.0))
+        shift = max(-max_shift_px, min(max_shift_px, x_center - (ax + aw // 2)))
+
+        def shift_and_expand(roi: ROI, allow_expand: bool = True) -> ROI:
+            x, y, w, h = roi
+            nw = w
+            if allow_expand:
+                nw = int(w * (1.0 + max_expand_ratio * 0.5))
+            nx = x + shift
+            shifted = (nx, y, nw, h)
+            clipped, _ = _clip_roi_to_parent(shifted, active_roi)
+            return clipped
+
+        entry = shift_and_expand(entry)
+        core = shift_and_expand(core, allow_expand=False)
+        if core[2] > int(aw * max_core_width_ratio):
+            core = (core[0], core[1], int(aw * max_core_width_ratio), core[3])
+            core, _ = _clip_roi_to_parent(core, active_roi)
+        exit_roi = shift_and_expand(exit_roi)
+
+        y_low = int(_quantile(ys, 0.20, ay + int(ah * 0.40))) - headroom_px
+        y_high = int(_quantile(ys, 0.88, ay + int(ah * 0.85))) + footroom_px
+        y_low = max(ay, y_low)
+        y_high = min(ay + ah, y_high)
+        height_new = max(min_h, int(ah * min_height_ratio), y_high - y_low)
+
+        entry = _clip_roi_to_parent((entry[0], y_low, entry[2], height_new), active_roi)[0]
+        core = _clip_roi_to_parent((core[0], y_low, core[2], height_new), active_roi)[0]
+        exit_roi = _clip_roi_to_parent((exit_roi[0], y_low, exit_roi[2], height_new), active_roi)[0]
+    else:
+        warnings.append("Insufficient reliable tracks; used conservative geometric template with no micro-adjust.")
+
+    # geometry sanity checks
+    geometry_flags: List[str] = []
+    if entry[0] < ax + safe_border_margin_px:
+        geometry_flags.append("entry_too_close_left_border")
+    if exit_roi[0] + exit_roi[2] > ax + aw - safe_border_margin_px:
+        geometry_flags.append("exit_too_close_right_border")
+    if core[2] > int(aw * max_core_width_ratio):
+        geometry_flags.append("core_too_wide")
+    if core[3] < int(ah * min_height_ratio):
+        geometry_flags.append("core_too_short")
+
+    if geometry_flags:
+        warnings.append("ROI geometry sanity warnings: " + ", ".join(geometry_flags))
+
     tracking_roi = _build_tracking_roi([entry, core, exit_roi], int(cfg.get("tracking", {}).get("tracking_roi_margin_px", 50)), active_roi)
 
     # scores
-    track_count_score = min(1.0, len(track_samples) / max(1, min_valid_tracks))
-
-    deltas = []
-    for pts in track_samples.values():
-        if len(pts) >= 2:
-            deltas.append(pts[-1][0] - pts[0][0])
-    if deltas:
-        pos = sum(1 for d in deltas if d > 0)
-        neg = sum(1 for d in deltas if d < 0)
-        direction_consistency_score = max(pos, neg) / max(1, pos + neg)
+    track_count_score = min(1.0, used_track_count / max(1, min_valid_tracks))
+    if used_track_count > 0:
+        deltas = []
+        ys_spread = []
+        for feat in track_features.values():
+            pts = feat.get("points", [])
+            if len(pts) >= 2:
+                deltas.append(pts[-1][0] - pts[0][0])
+                ys_spread.extend([p[1] for p in pts])
+        if deltas:
+            pos = sum(1 for d in deltas if d > 0)
+            neg = sum(1 for d in deltas if d < 0)
+            direction_consistency_score = max(pos, neg) / max(1, pos + neg)
+        else:
+            direction_consistency_score = 0.35
+        if ys_spread:
+            std_y = (max(ys_spread) - min(ys_spread)) / max(1.0, ah)
+            path_compactness_score = max(0.0, 1.0 - min(1.0, std_y))
+        else:
+            path_compactness_score = 0.4
     else:
-        direction_consistency_score = 0.3
+        direction_consistency_score = 0.35
+        path_compactness_score = 0.35
 
-    std_y = (max(ys) - min(ys)) / max(1.0, ah)
-    path_compactness_score = max(0.0, 1.0 - min(1.0, std_y))
-    overall = (track_count_score + direction_consistency_score + path_compactness_score) / 3.0
+    geometry_penalty = 0.12 * len(geometry_flags)
+    overall = max(0.0, (track_count_score + direction_consistency_score + path_compactness_score) / 3.0 - geometry_penalty)
 
     return {
         "result": {
@@ -517,9 +703,12 @@ def _suggest_rois_from_tracks(track_samples: Dict[int, List[Tuple[float, float]]
             "track_count_score": round(track_count_score, 3),
             "direction_consistency_score": round(direction_consistency_score, 3),
             "path_compactness_score": round(path_compactness_score, 3),
+            "geometry_penalty": round(geometry_penalty, 3),
         },
         "warnings": warnings,
         "min_size_guard": {"min_roi_width_px": min_w, "min_roi_height_px": min_h},
+        "vertical_padding": {"headroom_px": headroom_px, "footroom_px": footroom_px},
+        "geometry_flags": geometry_flags,
     }
 
 
@@ -674,7 +863,7 @@ def run_pipeline(config_path: Path) -> int:
         core_reacquire_max_dist_px=float(tracking_cfg.get("core_reacquire_max_dist_px", 120)),
     )
 
-    track_samples: Dict[int, List[Tuple[float, float]]] = {}
+    track_features: Dict[int, Dict[str, Any]] = {}
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     fidx = 0
@@ -688,16 +877,18 @@ def run_pipeline(config_path: Path) -> int:
         dets = detector.predict_frame(frame)
         filtered = _filter_detections_for_tracking(dets, tracking_cfg, active_frame_roi, tracking_roi)
         assigns = tracker_calib.update(filtered, fidx)
-        for a in assigns:
-            cx, cy = _bbox_center(a.detection.bbox_xyxy)
-            track_samples.setdefault(a.track_id, []).append((cx, cy))
+        frame_feats = _build_track_features(assigns)
+        for tid, feat in frame_feats.items():
+            acc = track_features.setdefault(tid, {"points": [], "areas": [], "heights": [], "center_x": [], "center_y": []})
+            for k in ["points", "areas", "heights", "center_x", "center_y"]:
+                acc[k].extend(feat[k])
         fidx += 1
 
     # direction with fallback chain
-    direction_info = _infer_direction_from_tracks(track_samples, config, template)
+    direction_info = _infer_direction_from_tracks(track_features, active_frame_roi, _parse_roi(clipped_roi_cfg, "core_roi"), config, template)
 
     # roi suggestion
-    roi_suggestion = _suggest_rois_from_tracks(track_samples, active_frame_roi, direction_info["final"]["value"], config)
+    roi_suggestion = _suggest_rois_from_tracks(track_features, active_frame_roi, direction_info["final"]["value"], config)
 
     # apply suggested rois as runtime rois
     clipped_roi_cfg.update(roi_suggestion["result"])
@@ -737,12 +928,29 @@ def run_pipeline(config_path: Path) -> int:
         )
 
     manual_reasons: List[str] = []
+    risk_flags: List[str] = []
     if active_result["fallback_used"]:
-        manual_reasons.append("active_frame_auto used fallback")
+        risk_flags.append("active_fallback")
+        manual_reasons.append(f"active_frame_auto fallback used: source={active_result['fallback_source']}, validity={active_result['validity']}")
     if direction_info["final"]["source"] != "auto" and direction_info["mode"] == "auto":
-        manual_reasons.append("direction fallback path used")
-    if roi_suggestion["scores"]["overall_confidence_score"] < 0.7:
-        manual_reasons.append("roi_suggestion overall_confidence_score is low")
+        risk_flags.append("direction_fallback")
+        ex = direction_info.get("explainability", {})
+        manual_reasons.append(
+            "direction_auto unreliable: "
+            f"voting_tracks={ex.get('voting_tracks', 0)}, "
+            f"l2r={ex.get('left_to_right_score', 0)}, r2l={ex.get('right_to_left_score', 0)}, "
+            f"confidence={ex.get('final_confidence', 0)}"
+        )
+    if direction_info.get("explainability", {}).get("final_confidence", 0.0) < 0.62:
+        risk_flags.append("direction_low_confidence")
+    if roi_suggestion["geometry_flags"]:
+        risk_flags.append("roi_geometry_anomaly")
+        manual_reasons.append("roi_geometry anomalies: " + ", ".join(roi_suggestion["geometry_flags"]))
+    if roi_suggestion["scores"]["overall_confidence_score"] < 0.65:
+        risk_flags.append("roi_low_score")
+        manual_reasons.append(
+            f"roi_suggestion overall_confidence_score low: {roi_suggestion['scores']['overall_confidence_score']}"
+        )
 
     calibration_report = {
         "schema_version": "1.0.0",
@@ -775,7 +983,7 @@ def run_pipeline(config_path: Path) -> int:
         },
         "manual_review": {
             "recommended": bool(manual_reasons),
-            "priority": "high" if len(manual_reasons) >= 2 else ("medium" if len(manual_reasons) == 1 else "low"),
+            "priority": "high" if ("active_fallback" in risk_flags or "direction_fallback" in risk_flags or "roi_geometry_anomaly" in risk_flags or len(risk_flags) >= 2) else ("medium" if len(risk_flags) == 1 else "low"),
             "reasons": manual_reasons,
             "suggested_actions": [
                 "Check active_frame_roi and side black bars alignment.",
