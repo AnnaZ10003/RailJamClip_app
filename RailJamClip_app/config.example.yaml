@@ -35,8 +35,10 @@ calibration:
     min_content_width_ratio: 0.45
     max_content_width_ratio: 0.94
     max_width_jitter_px: 32
-    fallback_mode: "template_or_default"
-    default_active_frame_roi: { x: 120, y: 0, w: 960, h: 1080 }
+    fallback_mode: "template_or_dynamic_conservative_default"
+    dynamic_default_width_ratio: 0.74
+    dynamic_default_side_margin_ratio: 0.12
+    dynamic_default_min_side_margin_px: 80
 
   roi_suggestion:
     enabled: true
@@ -60,15 +62,15 @@ calibration:
       min_roi_height_px: 120
 
   direction_auto:
-    min_track_points: 4
-    min_move_px: 40
-    min_bbox_area_px: 1400
-    min_bbox_height_px: 48
-    min_bottom_region_ratio: 0.50
-    max_core_distance_ratio: 0.35
-    min_direction_consistency: 0.62
+    min_track_points: 5
+    min_move_px: 60
+    min_bbox_area_px: 2000
+    min_bbox_height_px: 58
+    min_bottom_region_ratio: 0.58
+    max_core_distance_ratio: 0.28
+    min_direction_consistency: 0.70
     min_voting_tracks: 2
-    min_final_confidence: 0.62
+    min_final_confidence: 0.68
 
 template:
   enabled: true
