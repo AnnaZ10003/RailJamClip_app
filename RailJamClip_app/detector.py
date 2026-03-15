@@ -1,4 +1,4 @@
-"""YOLO person detector skeleton.
+"""YOLO person detector for RailJamClip_app.
 
 职责：
 - 加载 Ultralytics YOLO 模型
@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Tuple
+from typing import Any, List, Tuple
 
 
 @dataclass
@@ -24,12 +24,15 @@ class Detection:
 class PersonDetector:
     """人物检测器（MVP）。"""
 
-    def __init__(self, model_path: str, device: str, conf_threshold: float, iou_threshold: float, person_class_id: int = 0, max_det: int = 20) -> None:
-        """初始化模型参数。
-
-        TODO:
-            - 实际加载 YOLO 模型对象。
-        """
+    def __init__(
+        self,
+        model_path: str,
+        device: str,
+        conf_threshold: float,
+        iou_threshold: float,
+        person_class_id: int = 0,
+        max_det: int = 20,
+    ) -> None:
         self.model_path = model_path
         self.device = device
         self.conf_threshold = conf_threshold
@@ -37,18 +40,42 @@ class PersonDetector:
         self.person_class_id = person_class_id
         self.max_det = max_det
 
+        # 延迟加载，避免未使用检测链路时强依赖。
+        from ultralytics import YOLO
+
+        self.model = YOLO(self.model_path)
+
     def predict_frame(self, frame_bgr: Any) -> List[Detection]:
-        """对单帧做 person 检测。
+        """对单帧做 person 检测并返回 person 框。"""
+        results = self.model.predict(
+            source=frame_bgr,
+            conf=self.conf_threshold,
+            iou=self.iou_threshold,
+            device=self.device,
+            max_det=self.max_det,
+            verbose=False,
+        )
 
-        Args:
-            frame_bgr: OpenCV BGR 图像。
+        detections: List[Detection] = []
+        if not results:
+            return detections
 
-        Returns:
-            仅 person 的检测列表。
+        boxes = results[0].boxes
+        if boxes is None:
+            return detections
 
-        TODO:
-            - 调用 ultralytics 模型推理
-            - 过滤 class_id == person
-            - 组装 Detection
-        """
-        raise NotImplementedError
+        for box in boxes:
+            cls_id = int(box.cls.item())
+            if cls_id != self.person_class_id:
+                continue
+
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            conf = float(box.conf.item())
+            detections.append(
+                Detection(
+                    bbox_xyxy=(float(x1), float(y1), float(x2), float(y2)),
+                    confidence=conf,
+                    class_id=cls_id,
+                )
+            )
+        return detections

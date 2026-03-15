@@ -12,6 +12,11 @@ output:
   save_debug_log: true
   debug_log_path: "logs/run.log"
 
+debug:
+  # 方案B：输出每帧检测框信息到调试 JSON
+  export_detection_json: true
+  detection_json_path: "output/detections_debug.json"
+
 detector:
   model_path: "yolov8n.pt"
   device: "cpu"                # "cpu" | "cuda:0"
@@ -19,6 +24,7 @@ detector:
   iou_threshold: 0.50
   person_class_id: 0
   max_det: 20
+  frame_step: 1                 # 1=逐帧；2=每2帧检测一次
 
 tracking:
   enabled: true

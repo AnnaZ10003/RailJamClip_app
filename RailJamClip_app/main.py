@@ -5,7 +5,9 @@
 - 校验输入视频路径
 - 读取视频基础信息
 - 创建 output/clips 与 logs 目录
-- 生成并写出“无事件占位运行”的 metadata.json
+- 接入 YOLO person 检测并统计检测结果
+- 可选输出每帧检测框调试 JSON
+- 生成并写出 metadata.json（当前不做 tracking/roi_event/clips）
 """
 
 from __future__ import annotations
@@ -13,10 +15,13 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
+import cv2
+
+from detector import Detection, PersonDetector
 from metadata import build_metadata, write_metadata
-from utils import ensure_dir, load_config, read_video_info
+from utils import ensure_dir, load_config, read_video_info, write_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,12 +42,7 @@ def _utc_now_iso() -> str:
 
 
 def _detect_repo_name_fallback() -> str:
-    """根据当前文件所在目录推断仓库/项目名。
-
-    说明：
-    - 当前代码位于 `<repo_root>/RailJamClip_app/main.py`
-    - 若配置未提供 `project.project_name`，优先使用父目录名作为兜底。
-    """
+    """根据当前文件所在目录推断仓库/项目名。"""
     return Path(__file__).resolve().parent.name
 
 
@@ -59,8 +59,24 @@ def _build_run_info(config: Dict[str, Any], started_at: str, finished_at: str, s
     }
 
 
+def _to_debug_item(frame_idx: int, detections: List[Detection]) -> Dict[str, Any]:
+    """将单帧检测结果转换为调试 JSON 结构。"""
+    return {
+        "frame_index": frame_idx,
+        "person_count": len(detections),
+        "detections": [
+            {
+                "bbox_xyxy": [d.bbox_xyxy[0], d.bbox_xyxy[1], d.bbox_xyxy[2], d.bbox_xyxy[3]],
+                "confidence": d.confidence,
+                "class_id": d.class_id,
+            }
+            for d in detections
+        ],
+    }
+
+
 def run_pipeline(config_path: Path) -> int:
-    """运行本轮最小可运行流程（无事件占位）。"""
+    """运行本轮检测链路 MVP（无事件占位）。"""
     started_at = _utc_now_iso()
     config = load_config(config_path)
 
@@ -73,12 +89,73 @@ def run_pipeline(config_path: Path) -> int:
     clips_dir = Path(config["output"]["clips_dir"])
     debug_log_path = Path(config["output"]["debug_log_path"])
     metadata_path = Path(config["output"]["metadata_path"])
+    debug_json_enabled = bool(config.get("debug", {}).get("export_detection_json", True))
+    debug_json_path = Path(config.get("debug", {}).get("detection_json_path", "output/detections_debug.json"))
 
     ensure_dir(clips_dir)
     ensure_dir(debug_log_path.parent)
 
-    # 本轮不做检测/跟踪/事件识别，按无事件占位输出。
-    events = []
+    detector_cfg = config.get("detector", {})
+    frame_step = int(detector_cfg.get("frame_step", 1))
+    if frame_step <= 0:
+        raise ValueError("detector.frame_step must be >= 1")
+
+    detector = PersonDetector(
+        model_path=detector_cfg["model_path"],
+        device=detector_cfg.get("device", "cpu"),
+        conf_threshold=float(detector_cfg.get("conf_threshold", 0.35)),
+        iou_threshold=float(detector_cfg.get("iou_threshold", 0.5)),
+        person_class_id=int(detector_cfg.get("person_class_id", 0)),
+        max_det=int(detector_cfg.get("max_det", 20)),
+    )
+
+    cap = cv2.VideoCapture(str(input_video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Failed to open video for detection: {input_video_path}")
+
+    processed_frames = 0
+    frames_with_person = 0
+    total_person_boxes = 0
+    debug_frames: List[Dict[str, Any]] = []
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % frame_step != 0:
+            frame_idx += 1
+            continue
+
+        detections = detector.predict_frame(frame)
+        processed_frames += 1
+        total_person_boxes += len(detections)
+        if detections:
+            frames_with_person += 1
+
+        if debug_json_enabled:
+            debug_frames.append(_to_debug_item(frame_idx, detections))
+
+        frame_idx += 1
+
+    cap.release()
+
+    if debug_json_enabled:
+        write_json(
+            {
+                "video_path": str(input_video_path),
+                "frame_step": frame_step,
+                "processed_frames": processed_frames,
+                "frames_with_person": frames_with_person,
+                "total_person_boxes": total_person_boxes,
+                "frames": debug_frames,
+            },
+            debug_json_path,
+        )
+
+    # 本轮不做 tracking / roi_event / clips。
+    events: List[Dict[str, Any]] = []
     summary = {
         "candidate_events": 0,
         "qualified_events": 0,

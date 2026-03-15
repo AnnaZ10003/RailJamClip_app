@@ -5,10 +5,12 @@
 - 视频基础信息读取
 - 时间/帧换算
 - 路径创建
+- JSON 写出
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict
 
@@ -17,14 +19,7 @@ import yaml
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
-    """读取 YAML 配置。
-
-    Args:
-        config_path: 配置文件路径。
-
-    Returns:
-        dict 配置对象。
-    """
+    """读取 YAML 配置。"""
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
@@ -37,14 +32,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
 
 
 def read_video_info(video_path: Path) -> Dict[str, Any]:
-    """读取视频基础信息。
-
-    Args:
-        video_path: 输入视频路径。
-
-    Returns:
-        包含 fps、total_frames、width、height、duration_seconds 的字典。
-    """
+    """读取视频基础信息。"""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError(f"Failed to open video: {video_path}")
@@ -83,3 +71,10 @@ def time_to_frame(time_sec: float, fps: float) -> int:
 def ensure_dir(path: Path) -> None:
     """确保目录存在。"""
     path.mkdir(parents=True, exist_ok=True)
+
+
+def write_json(data: Dict[str, Any], path: Path) -> None:
+    """写出 JSON 文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
