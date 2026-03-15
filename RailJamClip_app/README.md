@@ -16,7 +16,8 @@
 3. 仅保留 `person` 类检测框
 4. 基于 IOU 优先 + 中心点距离兜底实现最小 tracking
 5. 输出检测+tracking 调试 JSON（每帧 person 框与 track_id）
-6. 输出符合 required 模板的 `metadata.json`（当前 `events` 为空）
+6. 输出 tracking 调试预览视频（bbox/track_id/confirmed + ROI）
+7. 输出符合 required 模板的 `metadata.json`（当前 `events` 为空）
 
 尚未实现（后续）：
 - entry/core/exit 状态机
@@ -38,7 +39,8 @@ python main.py --config config.yaml
 
 ## 本轮输出
 - `output/metadata.json`：required 顶层结构（summary 四个必填计数存在）
-- `output/detections_debug.json`：检测+tracking 调试输出（若 `debug.export_detection_json=true`）
+- `output/detections_debug.json`：检测+tracking 调试 JSON（若 `debug.export_detection_json=true`）
+- `output/preview_tracking.mp4`：tracking 可视化预览（若 `debug.export_preview_video=true`）
 - `output/clips/` 与 `logs/` 目录会被创建
 
 ## 配置重点
@@ -46,4 +48,6 @@ python main.py --config config.yaml
 - `detector.imgsz`：YOLO 推理尺寸，默认 `640`（CPU 推荐起步值）
 - `debug.export_detection_json`：是否导出调试 JSON
 - `debug.detection_json_path`：调试 JSON 输出路径
+- `debug.export_preview_video`：是否导出预览视频
+- `debug.preview_video_path`：预览视频输出路径
 - 运行时会打印最小进度日志（每处理 50 帧打印一次 `当前帧/总帧数`）
