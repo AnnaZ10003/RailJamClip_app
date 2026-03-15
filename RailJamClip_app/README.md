@@ -45,3 +45,6 @@ python main.py --config config.yaml
 - `detector.frame_step`：检测步长（`1`=逐帧，`2`=每2帧一次）
 - `debug.export_detection_json`：是否导出调试 JSON
 - `debug.detection_json_path`：调试 JSON 输出路径
+
+- `detector.imgsz`：YOLO 推理尺寸，默认 `640`（CPU 推荐起步值）
+- 运行时会打印最小进度日志（每处理 50 帧打印一次 `当前帧/总帧数`）

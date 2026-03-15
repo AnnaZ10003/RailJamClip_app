@@ -79,12 +79,20 @@ def run_pipeline(config_path: Path) -> int:
     """运行本轮检测链路 MVP（无事件占位）。"""
     started_at = _utc_now_iso()
     config = load_config(config_path)
+    print(f"[INFO] 已读取配置: {config_path}")
 
     input_video_path = Path(config["input"]["video_path"])
     if not input_video_path.exists():
         raise FileNotFoundError(f"Input video not found: {input_video_path}")
 
     video_info = read_video_info(input_video_path)
+    print(f"[INFO] 已打开视频: {input_video_path}")
+    print(
+        "[INFO] 视频基础信息: "
+        f"fps={video_info['fps']}, total_frames={video_info['total_frames']}, "
+        f"width={video_info['width']}, height={video_info['height']}, "
+        f"duration_seconds={video_info['duration_seconds']:.3f}"
+    )
 
     clips_dir = Path(config["output"]["clips_dir"])
     debug_log_path = Path(config["output"]["debug_log_path"])
@@ -99,20 +107,25 @@ def run_pipeline(config_path: Path) -> int:
     frame_step = int(detector_cfg.get("frame_step", 1))
     if frame_step <= 0:
         raise ValueError("detector.frame_step must be >= 1")
+    print(f"[INFO] 当前抽帧步长 detector.frame_step={frame_step}")
 
+    print("[INFO] 正在加载 YOLO 模型...")
     detector = PersonDetector(
         model_path=detector_cfg["model_path"],
         device=detector_cfg.get("device", "cpu"),
         conf_threshold=float(detector_cfg.get("conf_threshold", 0.35)),
         iou_threshold=float(detector_cfg.get("iou_threshold", 0.5)),
+        imgsz=int(detector_cfg.get("imgsz", 640)),
         person_class_id=int(detector_cfg.get("person_class_id", 0)),
         max_det=int(detector_cfg.get("max_det", 20)),
     )
+    print("[INFO] YOLO 模型已加载")
 
     cap = cv2.VideoCapture(str(input_video_path))
     if not cap.isOpened():
         raise ValueError(f"Failed to open video for detection: {input_video_path}")
 
+    total_frames = int(video_info.get("total_frames", 0))
     processed_frames = 0
     frames_with_person = 0
     total_person_boxes = 0
@@ -124,6 +137,7 @@ def run_pipeline(config_path: Path) -> int:
         if not ret:
             break
 
+        # 安全抽样：仅对抽样帧调用 YOLO，非抽样帧直接跳过。
         if frame_idx % frame_step != 0:
             frame_idx += 1
             continue
@@ -136,6 +150,10 @@ def run_pipeline(config_path: Path) -> int:
 
         if debug_json_enabled:
             debug_frames.append(_to_debug_item(frame_idx, detections))
+
+        if processed_frames % 50 == 0:
+            current_frame = frame_idx + 1
+            print(f"[INFO] 检测进度: {current_frame}/{total_frames}")
 
         frame_idx += 1
 
