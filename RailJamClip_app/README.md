@@ -17,9 +17,9 @@
 4. 基于 IOU 优先 + 中心点距离兜底 + 短时连续性实现最小 tracking
 5. 使用 `active_frame_roi` 排除两侧黑边干扰
 6. 使用 `tracking_roi`（由 entry/core/exit 外包矩形+margin 自动生成）过滤背景人物
-7. 使用最小 bbox 尺寸过滤减少小目标噪声
-8. 输出检测+tracking 调试 JSON（每帧 person 框与 track_id）
-9. 输出 tracking 调试预览视频（bbox/track_id/confirmed + ROI）
+7. 输出检测+tracking 调试 JSON（每帧 person 框与 track_id）
+8. 输出 tracking 调试预览视频（bbox/track_id/confirmed + ROI）
+9. 输出首帧 ROI 标定图 `output/calibration_preview.jpg`
 10. 输出符合 required 模板的 `metadata.json`（当前 `events` 为空）
 
 尚未实现（后续）：
@@ -41,6 +41,7 @@ python main.py --config config.yaml
 ```
 
 ## 本轮输出
+- `output/calibration_preview.jpg`：首帧标定图（整帧边界 + active/entry/core/exit + 坐标文字）
 - `output/metadata.json`：required 顶层结构（summary 四个必填计数存在）
 - `output/detections_debug.json`：检测+tracking 调试 JSON（若 `debug.export_detection_json=true`）
 - `output/preview_tracking.mp4`：tracking 可视化预览（若 `debug.export_preview_video=true`）
@@ -49,10 +50,9 @@ python main.py --config config.yaml
 ## 配置重点
 - `roi.active_frame_roi`：有效画面区域（先裁剪到视频边界；预览画的是裁剪后结果）
 - `roi.entry_roi/core_roi/exit_roi`：第一版使用整帧坐标配置，再裁剪到 `active_frame_roi` 内
+- `calibration.export_calibration_preview`：是否导出首帧标定图
+- `calibration.preview_image_path`：标定图输出路径
 - `tracking.tracking_roi_margin_px`：自动生成走廊 ROI 外扩边距（在 active_frame_roi 内截断）
-- `tracking.min_bbox_width_px/min_bbox_height_px/min_bbox_area_px`：进入 tracking 的最小框过滤
-- `tracking.min_motion_frames/min_motion_distance_px/direction_min_progress_px`：仅用于候选轨迹升级 confirmed 前的运动过滤
+- `tracking.min_motion_frames/min_motion_distance_px/direction_min_progress_px`：仅用于候选轨迹升级 confirmed 前的运动过滤（本版默认先放松）
 - `tracking.core_reacquire_max_frames/core_reacquire_max_dist_px`：仅对 confirmed 且 entered_core 的丢失轨迹保活重连
-- `detector.frame_step`：检测/追踪步长（默认 `2`，更适合 CPU 测试）
-- `detector.imgsz`：YOLO 推理尺寸，默认 `640`
 - ROI 会在加载后自动裁剪到边界；若被裁剪或过小会输出 warning

@@ -5,6 +5,7 @@
 - 校验输入视频路径
 - 读取视频基础信息
 - 创建 output/clips 与 logs 目录
+- 输出首帧 calibration 标定图（ROI 可视化）
 - 接入 YOLO person 检测并统计检测结果
 - 接入最小 tracking（IOU 优先 + 中心点距离兜底 + 轻量保活）
 - active_frame_roi 约束所有 ROI/tracking 绘制与过滤
@@ -141,12 +142,13 @@ def _build_tracking_roi(stage_rois: List[ROI], margin_px: int, active_frame_roi:
     return clipped
 
 
-def _draw_roi(frame_bgr: Any, roi: ROI, label: str, color: Tuple[int, int, int]) -> None:
+def _draw_roi(frame_bgr: Any, roi: ROI, label: str, color: Tuple[int, int, int], with_coords: bool = False) -> None:
     x, y, w, h = roi
     if w <= 0 or h <= 0:
         return
     cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), color, 2)
-    cv2.putText(frame_bgr, label, (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    title = label if not with_coords else f"{label} ({x},{y},{w},{h})"
+    cv2.putText(frame_bgr, title, (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
 
 def _draw_tracking_overlay(frame_bgr: Any, frame_idx: int, assignments: List[TrackAssignment], clipped_roi_cfg: Dict[str, Any]) -> Any:
@@ -166,6 +168,33 @@ def _draw_tracking_overlay(frame_bgr: Any, frame_idx: int, assignments: List[Tra
     info = f"frame={frame_idx} persons={len(assignments)}"
     cv2.putText(frame_bgr, info, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return frame_bgr
+
+
+def _render_calibration_preview(first_frame: Any, clipped_roi_cfg: Dict[str, Any], out_path: Path) -> None:
+    frame = first_frame.copy()
+    fh, fw = frame.shape[:2]
+
+    # 整帧边界
+    cv2.rectangle(frame, (0, 0), (fw - 1, fh - 1), (255, 255, 255), 2)
+    cv2.putText(frame, f"frame (0,0,{fw},{fh})", (12, fh - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+    active = _parse_roi(clipped_roi_cfg, "active_frame_roi")
+    entry = _parse_roi(clipped_roi_cfg, "entry_roi")
+    core = _parse_roi(clipped_roi_cfg, "core_roi")
+    exit_roi = _parse_roi(clipped_roi_cfg, "exit_roi")
+
+    _draw_roi(frame, active, "active_frame_roi", (210, 210, 210), with_coords=True)
+    _draw_roi(frame, entry, "entry_roi", (255, 200, 0), with_coords=True)
+    _draw_roi(frame, core, "core_roi", (255, 255, 0), with_coords=True)
+    _draw_roi(frame, exit_roi, "exit_roi", (0, 200, 255), with_coords=True)
+
+    # 左上角再次明确 active 参数
+    ax, ay, aw, ah = active
+    cv2.putText(frame, f"active_frame_roi: x={ax}, y={ay}, w={aw}, h={ah}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (230, 230, 230), 2)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), frame)
+    print(f"[INFO] Calibration preview saved: {out_path}")
 
 
 def _filter_detections_for_tracking(
@@ -227,6 +256,10 @@ def run_pipeline(config_path: Path) -> int:
     preview_enabled = bool(debug_cfg.get("export_preview_video", True))
     preview_path = Path(debug_cfg.get("preview_video_path", "output/preview_tracking.mp4"))
 
+    calibration_cfg = config.get("calibration", {})
+    calibration_enabled = bool(calibration_cfg.get("export_calibration_preview", True))
+    calibration_preview_path = Path(calibration_cfg.get("preview_image_path", "output/calibration_preview.jpg"))
+
     ensure_dir(clips_dir)
     ensure_dir(debug_log_path.parent)
 
@@ -255,13 +288,27 @@ def run_pipeline(config_path: Path) -> int:
         clipped_roi_cfg[key] = _roi_to_cfg(clipped_stage)
         stage_rois.append(clipped_stage)
 
-    tracking_roi = _build_tracking_roi(stage_rois, int(tracking_cfg.get("tracking_roi_margin_px", 80)), active_frame_roi)
+    tracking_roi = _build_tracking_roi(stage_rois, int(tracking_cfg.get("tracking_roi_margin_px", 50)), active_frame_roi)
     _warn_if_small_roi("tracking_roi", tracking_roi, frame_w, frame_h, roi_min_w, roi_min_h, roi_min_area_ratio)
     clipped_roi_cfg["tracking_roi"] = _roi_to_cfg(tracking_roi)
+
+    # 先取首帧用于标定图
+    cap = cv2.VideoCapture(str(input_video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Failed to open video for detection: {input_video_path}")
+
+    ret, first_frame = cap.read()
+    if not ret:
+        cap.release()
+        raise ValueError("Failed to read first frame for calibration preview")
+
+    if calibration_enabled:
+        _render_calibration_preview(first_frame, clipped_roi_cfg, calibration_preview_path)
 
     detector_cfg = config.get("detector", {})
     frame_step = int(detector_cfg.get("frame_step", 2))
     if frame_step <= 0:
+        cap.release()
         raise ValueError("detector.frame_step must be >= 1")
     print(f"[INFO] 当前抽帧步长 detector.frame_step={frame_step}")
 
@@ -283,18 +330,14 @@ def run_pipeline(config_path: Path) -> int:
         max_center_distance_px=float(tracking_cfg.get("max_center_distance_px", 80)),
         max_lost_frames=int(tracking_cfg.get("max_lost_frames", 8)),
         min_track_frames=int(tracking_cfg.get("min_track_frames", 6)),
-        motion_min_frames=int(tracking_cfg.get("min_motion_frames", 4)),
-        motion_min_distance_px=float(tracking_cfg.get("min_motion_distance_px", 18)),
+        motion_min_frames=int(tracking_cfg.get("min_motion_frames", 3)),
+        motion_min_distance_px=float(tracking_cfg.get("min_motion_distance_px", 10)),
         direction=str(config.get("event", {}).get("direction", "left_to_right")),
-        direction_min_progress_px=float(tracking_cfg.get("direction_min_progress_px", 10)),
+        direction_min_progress_px=float(tracking_cfg.get("direction_min_progress_px", 5)),
         core_roi=core_roi,
         core_reacquire_max_frames=int(tracking_cfg.get("core_reacquire_max_frames", 10)),
         core_reacquire_max_dist_px=float(tracking_cfg.get("core_reacquire_max_dist_px", 120)),
     )
-
-    cap = cv2.VideoCapture(str(input_video_path))
-    if not cap.isOpened():
-        raise ValueError(f"Failed to open video for detection: {input_video_path}")
 
     writer = None
     if preview_enabled:

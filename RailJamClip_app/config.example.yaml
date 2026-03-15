@@ -18,6 +18,11 @@ debug:
   export_preview_video: true
   preview_video_path: "output/preview_tracking.mp4"
 
+calibration:
+  # 第一版优先输出首帧静态标定图
+  export_calibration_preview: true
+  preview_image_path: "output/calibration_preview.jpg"
+
 detector:
   model_path: "yolov8n.pt"
   device: "cpu"                # "cpu" | "cuda:0"
@@ -37,14 +42,14 @@ tracking:
   max_lost_frames: 8
   min_track_frames: 6
 
-  # corridor ROI：由 entry/core/exit 外包矩形 + margin 自动生成（限定在 active_frame_roi 内）
+  # 竖屏场景建议：先将 margin 调小，减少背景人物进入
   use_tracking_roi: true
-  tracking_roi_margin_px: 80
+  tracking_roi_margin_px: 50
 
-  # 候选轨迹升级 confirmed 前的轻量运动过滤
-  min_motion_frames: 4
-  min_motion_distance_px: 18
-  direction_min_progress_px: 10
+  # 候选轨迹升级 confirmed 前的轻量运动过滤（本版先放松）
+  min_motion_frames: 3
+  min_motion_distance_px: 10
+  direction_min_progress_px: 5
 
   # core 保活（仅对 confirmed 且 entered_core=true 生效）
   core_reacquire_max_frames: 10
@@ -61,7 +66,7 @@ tracking:
   min_roi_area_ratio: 0.001
 
 roi:
-  # active_frame_roi: 真实有效画面区域（用于排除两侧黑边）
+  # active_frame_roi: 真实有效画面区域（竖屏推荐先只裁左右，不裁上下）
   active_frame_roi: { x: 120, y: 0, w: 960, h: 1080 }
 
   # 注意：entry/core/exit 使用“整帧坐标”配置，加载后会被裁剪到 active_frame_roi 内
