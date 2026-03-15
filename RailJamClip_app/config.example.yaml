@@ -1,0 +1,71 @@
+project:
+  project_name: "RailJamClip_app"
+  run_name: "demo_run_001"
+
+input:
+  video_path: "input/demo.mp4"
+
+output:
+  root_dir: "output"
+  clips_dir: "output/clips"
+  metadata_path: "output/metadata.json"
+  save_debug_log: true
+  debug_log_path: "logs/run.log"
+
+debug:
+  # 输出每帧检测框信息到调试 JSON
+  export_detection_json: true
+  detection_json_path: "output/detections_debug.json"
+
+  # 输出 tracking 可视化预览视频（本地调试用途）
+  export_preview_video: true
+  preview_video_path: "output/preview_tracking.mp4"
+
+detector:
+  model_path: "yolov8n.pt"
+  device: "cpu"                # "cpu" | "cuda:0"
+  conf_threshold: 0.35
+  iou_threshold: 0.50
+  imgsz: 640                # CPU 推荐先用 640，必要时可再降
+  person_class_id: 0
+  max_det: 20
+  frame_step: 2                 # 默认2，更适合CPU测试；1=逐帧
+
+tracking:
+  enabled: true
+  method: "centroid_iou"
+  association_policy: "iou_first_then_distance_fallback"
+  iou_threshold: 0.25
+  max_center_distance_px: 80
+  max_lost_frames: 8
+  min_track_frames: 6
+
+roi:
+  # entry/core/exit 永远表示事件顺序语义，不受 direction 改写
+  entry_roi: { x: 480, y: 260, w: 160, h: 200 }
+  core_roi:  { x: 650, y: 250, w: 220, h: 220 }
+  exit_roi:  { x: 900, y: 260, w: 160, h: 200 }
+
+event:
+  # direction 仅用于 x 方向一致性过滤
+  direction: "left_to_right"   # "left_to_right" | "right_to_left"
+  require_core: true
+
+  min_entry_frames: 2
+  min_core_frames: 3
+  min_exit_frames: 2
+
+  max_frames_between_stages: 45
+
+  min_event_seconds: 0.4
+  min_gap_seconds: 1.0
+
+  pre_roll_seconds: 1.0
+  post_roll_seconds: 1.0
+
+export:
+  method: "ffmpeg"             # "ffmpeg" | "opencv"
+  clip_name_template: "event_{index:03d}.mp4"
+  ffmpeg_video_codec: "libx264"
+  ffmpeg_audio_codec: "aac"
+  overwrite: true
