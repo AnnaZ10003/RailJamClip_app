@@ -1,0 +1,151 @@
+project:
+  project_name: "RailJamClip_app"
+  run_name: "demo_run_001"
+
+input:
+  video_path: "input/demo.mp4"
+
+output:
+  root_dir: "output"
+  clips_dir: "output/clips"
+  metadata_path: "output/metadata.json"
+  save_debug_log: true
+  debug_log_path: "logs/run.log"
+
+debug:
+  export_detection_json: true
+  detection_json_path: "output/detections_debug.json"
+  export_preview_video: true
+  preview_video_path: "output/preview_tracking.mp4"
+
+calibration:
+  export_calibration_preview: true
+  preview_image_path: "output/calibration_preview.jpg"
+  calibration_report_path: "output/calibration_report.json"
+
+  active_frame_auto:
+    enabled: true
+    sample_frames: 40
+    black_col_threshold: 10
+    min_non_black_ratio: 0.06
+    min_density_ratio: 0.015
+    min_continuous_width_ratio: 0.40
+    edge_inset_px: 10
+    edge_inset_max_px: 24
+    min_content_width_ratio: 0.45
+    max_content_width_ratio: 0.94
+    max_width_jitter_px: 32
+    fallback_mode: "template_or_default"
+    default_active_frame_roi: { x: 120, y: 0, w: 960, h: 1080 }
+
+  roi_suggestion:
+    enabled: true
+    sample_seconds: 20
+    min_valid_tracks: 3
+    template_geometry:
+      entry_ratio: [0.06, 0.20]
+      core_ratio: [0.34, 0.62]
+      exit_ratio: [0.78, 0.94]
+      max_core_width_ratio: 0.45
+      safe_border_margin_px: 24
+    micro_adjust:
+      max_shift_px: 36
+      max_expand_ratio: 0.12
+    vertical_padding:
+      headroom_px: 50
+      footroom_px: 35
+      min_height_ratio: 0.38
+    min_size_guard:
+      min_roi_width_px: 80
+      min_roi_height_px: 120
+
+  direction_auto:
+    min_track_points: 4
+    min_move_px: 40
+    min_bbox_area_px: 1400
+    min_bbox_height_px: 48
+    min_bottom_region_ratio: 0.50
+    max_core_distance_ratio: 0.35
+    min_direction_consistency: 0.62
+    min_voting_tracks: 2
+    min_final_confidence: 0.62
+
+template:
+  enabled: true
+  template_id: "camera_001"
+  save_path: "templates/camera_001.json"
+  direction_mode: "auto"            # auto | fixed
+  direction_value: null              # left_to_right | right_to_left | null
+
+detector:
+  model_path: "yolov8n.pt"
+  device: "cpu"                # "cpu" | "cuda:0"
+  conf_threshold: 0.35
+  iou_threshold: 0.50
+  imgsz: 640
+  person_class_id: 0
+  max_det: 20
+  frame_step: 2                  # 默认2，更适合CPU测试；1=逐帧
+
+tracking:
+  enabled: true
+  method: "centroid_iou"
+  association_policy: "iou_first_then_distance_fallback"
+  iou_threshold: 0.25
+  max_center_distance_px: 80
+  max_lost_frames: 8
+  min_track_frames: 6
+
+  use_tracking_roi: true
+  tracking_roi_margin_px: 50
+
+  # 候选轨迹升级 confirmed 前的轻量运动过滤（本版先放松）
+  min_motion_frames: 3
+  min_motion_distance_px: 10
+  direction_min_progress_px: 5
+
+  # core 保活（仅对 confirmed 且 entered_core=true 生效）
+  core_reacquire_max_frames: 10
+  core_reacquire_max_dist_px: 120
+
+  # 检测框最小尺寸过滤
+  min_bbox_width_px: 18
+  min_bbox_height_px: 24
+  min_bbox_area_px: 500
+
+  # ROI clipping 后过小告警阈值
+  min_roi_width_px: 24
+  min_roi_height_px: 24
+  min_roi_area_ratio: 0.001
+
+roi:
+  # active_frame_roi: 真实有效画面区域（竖屏推荐先只裁左右，不裁上下）
+  active_frame_roi: { x: 120, y: 0, w: 960, h: 1080 }
+
+  # 注意：entry/core/exit 使用“整帧坐标”配置，加载后会被裁剪到 active_frame_roi 内
+  entry_roi: { x: 480, y: 260, w: 160, h: 200 }
+  core_roi:  { x: 650, y: 250, w: 220, h: 220 }
+  exit_roi:  { x: 980, y: 260, w: 100, h: 180 }
+
+event:
+  direction: "left_to_right"   # "left_to_right" | "right_to_left"
+  require_core: true
+
+  min_entry_frames: 2
+  min_core_frames: 3
+  min_exit_frames: 2
+
+  max_frames_between_stages: 45
+
+  min_event_seconds: 0.4
+  min_gap_seconds: 1.0
+
+  pre_roll_seconds: 1.0
+  post_roll_seconds: 1.0
+
+export:
+  method: "ffmpeg"             # "ffmpeg" | "opencv"
+  clip_name_template: "event_{index:03d}.mp4"
+  ffmpeg_video_codec: "libx264"
+  ffmpeg_audio_codec: "aac"
+  overwrite: true
