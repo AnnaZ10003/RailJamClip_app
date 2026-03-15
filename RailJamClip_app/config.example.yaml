@@ -19,9 +19,37 @@ debug:
   preview_video_path: "output/preview_tracking.mp4"
 
 calibration:
-  # 第一版优先输出首帧静态标定图
   export_calibration_preview: true
   preview_image_path: "output/calibration_preview.jpg"
+  calibration_report_path: "output/calibration_report.json"
+
+  active_frame_auto:
+    enabled: true
+    sample_frames: 40
+    black_col_threshold: 10
+    min_content_width_ratio: 0.45
+    max_content_width_ratio: 0.98
+    max_width_jitter_px: 40
+    fallback_mode: "template_or_default"
+    default_active_frame_roi: { x: 120, y: 0, w: 960, h: 1080 }
+
+  roi_suggestion:
+    enabled: true
+    sample_seconds: 20
+    min_valid_tracks: 3
+    entry_ratio: [0.05, 0.25]
+    core_ratio:  [0.30, 0.70]
+    exit_ratio:  [0.75, 0.95]
+    min_size_guard:
+      min_roi_width_px: 80
+      min_roi_height_px: 100
+
+template:
+  enabled: true
+  template_id: "camera_001"
+  save_path: "templates/camera_001.json"
+  direction_mode: "auto"            # auto | fixed
+  direction_value: null              # left_to_right | right_to_left | null
 
 detector:
   model_path: "yolov8n.pt"
@@ -42,7 +70,6 @@ tracking:
   max_lost_frames: 8
   min_track_frames: 6
 
-  # 竖屏场景建议：先将 margin 调小，减少背景人物进入
   use_tracking_roi: true
   tracking_roi_margin_px: 50
 
@@ -72,7 +99,6 @@ roi:
   # 注意：entry/core/exit 使用“整帧坐标”配置，加载后会被裁剪到 active_frame_roi 内
   entry_roi: { x: 480, y: 260, w: 160, h: 200 }
   core_roi:  { x: 650, y: 250, w: 220, h: 220 }
-  # exit 建议贴近有效画面边界的窄区域
   exit_roi:  { x: 980, y: 260, w: 100, h: 180 }
 
 event:
