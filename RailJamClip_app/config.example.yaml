@@ -81,6 +81,16 @@ calibration:
     min_voting_tracks: 2
     min_final_confidence: 0.68
 
+    top_k: 4
+    min_main_subject_score: 0.45
+
+    # S_sparse is medium/weak corrective term; core signals are size/motion/corridor
+    score_weight_size: 0.34
+    score_weight_motion: 0.31
+    score_weight_corridor: 0.24
+    score_weight_sparse: 0.07
+    score_weight_continuity: 0.04
+
 template:
   enabled: true
   template_id: "camera_001"

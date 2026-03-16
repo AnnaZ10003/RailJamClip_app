@@ -615,8 +615,18 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "fallback_chain": [{"step": 1, "source": "fixed", "result": "used", "value": value}],
             "warnings": [],
             "explainability": {
-                "total_tracks": len(track_features), "filtered_out_tracks": 0, "voting_tracks": 0,
-                "left_to_right_score": 0.0, "right_to_left_score": 0.0, "final_confidence": 1.0,
+                "total_tracks": len(track_features),
+                "filtered_out_tracks": 0,
+                "prefilter_pass_tracks": 0,
+                "top_k_limit": 0,
+                "voting_tracks": 0,
+                "left_to_right_score": 0.0,
+                "right_to_left_score": 0.0,
+                "final_confidence": 1.0,
+                "top_k_selected": [],
+                "excluded_tracks": [],
+                "excluded_reason_counts": {},
+                "main_subject_profile_confidence": 1.0,
             },
         }
 
@@ -635,14 +645,41 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
     min_voting_tracks = int(dir_cfg.get("min_voting_tracks", 2))
     min_final_confidence = float(dir_cfg.get("min_final_confidence", 0.68))
 
-    candidates: List[Tuple[int, float, float]] = []
+    top_k = int(dir_cfg.get("top_k", 4))
+    min_main_subject_score = float(dir_cfg.get("min_main_subject_score", 0.45))
+
+    w_size = float(dir_cfg.get("score_weight_size", 0.34))
+    w_motion = float(dir_cfg.get("score_weight_motion", 0.31))
+    w_corridor = float(dir_cfg.get("score_weight_corridor", 0.24))
+    w_sparse = float(dir_cfg.get("score_weight_sparse", 0.07))
+    w_cont = float(dir_cfg.get("score_weight_continuity", 0.04))
+
+    reason_counts: Dict[str, int] = {}
+    excluded_tracks: List[Dict[str, Any]] = []
+    prefilter_candidates: List[Dict[str, Any]] = []
+
+    # determine crowd density map from centers
+    center_bins: Dict[int, int] = {}
+    for feat in track_features.values():
+        pts = feat.get("points", [])
+        if not pts:
+            continue
+        midx = int(median([p[0] for p in pts]) / max(1.0, aw * 0.12))
+        center_bins[midx] = center_bins.get(midx, 0) + 1
+
+    def _exclude(tid: int, reason: str) -> None:
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        excluded_tracks.append({"track_id": tid, "reason": reason})
+
     for tid, feat in track_features.items():
         pts = feat.get("points", [])
         if len(pts) < min_track_points:
+            _exclude(tid, "short_track")
             continue
         areas = feat.get("areas", [])
         heights = feat.get("heights", [])
         if not areas or not heights:
+            _exclude(tid, "missing_geometry")
             continue
 
         med_area = float(median(areas))
@@ -652,30 +689,84 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         move_abs = abs(delta_x)
         deltas = [pts[i + 1][0] - pts[i][0] for i in range(len(pts) - 1)]
         if not deltas:
+            _exclude(tid, "no_motion_series")
             continue
+
         pos = sum(1 for d in deltas if d > 0)
         neg = sum(1 for d in deltas if d < 0)
         consistency = max(pos, neg) / max(1, pos + neg)
         core_dist_ratio = abs(float(median([p[0] for p in pts])) - (cx + cw / 2.0)) / max(1.0, aw)
 
-        if med_area < min_area or med_h < min_height:
+        # hard filters to remove background towing/crossing flows
+        if med_area < min_area:
+            _exclude(tid, "small_bbox")
+            continue
+        if med_h < min_height:
+            _exclude(tid, "small_height")
             continue
         if med_y < ay + ah * min_bottom_ratio:
+            _exclude(tid, "upper_background")
             continue
         if core_dist_ratio > max_core_distance_ratio:
+            _exclude(tid, "far_from_core_corridor")
             continue
-        if move_abs < min_move_px or consistency < min_consistency:
+        if move_abs < min_move_px:
+            _exclude(tid, "low_horizontal_motion")
+            continue
+        if consistency < min_consistency:
+            _exclude(tid, "low_direction_consistency")
             continue
 
-        weight = (med_area / max(1.0, aw * ah)) * 2.5 + (move_abs / max(1.0, aw)) + (1.0 - core_dist_ratio)
-        candidates.append((tid, delta_x, max(0.01, weight)))
+        s_size = min(1.0, med_area / max(1.0, min_area * 2.0))
+        s_motion = min(1.0, move_abs / max(1.0, min_move_px * 2.0))
+        s_corridor = max(0.0, 1.0 - min(1.0, core_dist_ratio / max(1e-6, max_core_distance_ratio)))
 
-    l2r_score = sum(w for _, dx, w in candidates if dx > 0)
-    r2l_score = sum(w for _, dx, w in candidates if dx < 0)
+        midx = int(median([p[0] for p in pts]) / max(1.0, aw * 0.12))
+        local_crowd = center_bins.get(midx, 1)
+        s_sparse = max(0.0, 1.0 - min(1.0, (local_crowd - 1) / 4.0))
+
+        continuity = len(pts) / max(1.0, min_track_points * 2.0)
+        s_cont = min(1.0, continuity)
+
+        main_subject_score = (w_size * s_size) + (w_motion * s_motion) + (w_corridor * s_corridor) + (w_sparse * s_sparse) + (w_cont * s_cont)
+
+        if main_subject_score < min_main_subject_score:
+            _exclude(tid, "below_main_subject_score")
+            continue
+
+        prefilter_candidates.append({
+            "track_id": tid,
+            "delta_x": round(delta_x, 3),
+            "main_subject_score": round(main_subject_score, 4),
+            "features": {
+                "size_score": round(s_size, 3),
+                "motion_score": round(s_motion, 3),
+                "corridor_score": round(s_corridor, 3),
+                "sparse_score": round(s_sparse, 3),
+                "continuity_score": round(s_cont, 3),
+                "median_area": round(med_area, 1),
+                "median_height": round(med_h, 1),
+                "median_center_y": round(med_y, 1),
+                "core_distance_ratio": round(core_dist_ratio, 4),
+                "move_abs_px": round(move_abs, 2),
+            },
+        })
+
+    prefilter_candidates.sort(key=lambda x: x["main_subject_score"], reverse=True)
+    voting_candidates = prefilter_candidates[: max(0, top_k)]
+
+    l2r_score = sum(c["main_subject_score"] * abs(c["delta_x"]) for c in voting_candidates if c["delta_x"] > 0)
+    r2l_score = sum(c["main_subject_score"] * abs(c["delta_x"]) for c in voting_candidates if c["delta_x"] < 0)
     total_score = l2r_score + r2l_score
     confidence = max(l2r_score, r2l_score) / max(1e-6, total_score) if total_score > 0 else 0.0
 
-    reliable = (not active_unstable) and len(candidates) >= min_voting_tracks and total_score > 0 and confidence >= min_final_confidence
+    # profile confidence: how much top-k looks like main-subject group
+    if voting_candidates:
+        profile_conf = sum(c["main_subject_score"] for c in voting_candidates) / max(1, len(voting_candidates))
+    else:
+        profile_conf = 0.0
+
+    reliable = (not active_unstable) and len(voting_candidates) >= min_voting_tracks and total_score > 0 and confidence >= min_final_confidence
     chain = [{"step": 1, "source": "auto_inference", "result": "failed", "value": None}]
     warnings: List[str] = []
 
@@ -694,15 +785,21 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "warnings": warnings,
             "explainability": {
                 "total_tracks": total_tracks,
-                "filtered_out_tracks": max(0, total_tracks - len(candidates)),
-                "voting_tracks": len(candidates),
+                "filtered_out_tracks": len(excluded_tracks),
+                "prefilter_pass_tracks": len(prefilter_candidates),
+                "top_k_limit": top_k,
+                "voting_tracks": len(voting_candidates),
                 "left_to_right_score": round(l2r_score, 3),
                 "right_to_left_score": round(r2l_score, 3),
                 "final_confidence": round(confidence, 3),
+                "top_k_selected": voting_candidates,
+                "excluded_tracks": excluded_tracks,
+                "excluded_reason_counts": reason_counts,
+                "main_subject_profile_confidence": round(profile_conf, 3),
             },
         }
 
-    status = "failed_insufficient_candidates" if len(candidates) < min_voting_tracks else ("unstable" if active_unstable else "failed")
+    status = "failed_insufficient_candidates" if len(voting_candidates) < min_voting_tracks else ("unstable" if active_unstable else "failed")
     if status == "failed_insufficient_candidates":
         warnings.append("Direction auto failed: insufficient candidate tracks for voting.")
 
@@ -726,13 +823,20 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         "warnings": warnings,
         "explainability": {
             "total_tracks": total_tracks,
-            "filtered_out_tracks": max(0, total_tracks - len(candidates)),
-            "voting_tracks": len(candidates),
+            "filtered_out_tracks": len(excluded_tracks),
+            "prefilter_pass_tracks": len(prefilter_candidates),
+            "top_k_limit": top_k,
+            "voting_tracks": len(voting_candidates),
             "left_to_right_score": round(l2r_score, 3),
             "right_to_left_score": round(r2l_score, 3),
             "final_confidence": round(min(confidence, 0.55) if active_unstable else confidence, 3),
+            "top_k_selected": voting_candidates,
+            "excluded_tracks": excluded_tracks,
+            "excluded_reason_counts": reason_counts,
+            "main_subject_profile_confidence": round(profile_conf, 3),
         },
     }
+
 
 def _suggest_rois_from_tracks(track_features: Dict[int, Dict[str, Any]], active_roi: ROI, direction: str, direction_reliable: bool, cfg: Dict[str, Any], template: Optional[Dict[str, Any]], template_match: Dict[str, Any]) -> Dict[str, Any]:
     rs_cfg = cfg.get("calibration", {}).get("roi_suggestion", {})
@@ -1134,11 +1238,39 @@ def run_pipeline(config_path: Path) -> int:
             "code": "roi_geometry_anomaly",
             "message": "roi_geometry anomalies: " + ", ".join(roi_suggestion["geometry_flags"])
         })
+
+    # ROI invalidity hard check (e.g., w=0/h=0)
+    invalid_roi_names = []
+    for k in ["entry_roi", "core_roi", "exit_roi", "tracking_roi"]:
+        r = roi_suggestion["result"].get(k, {})
+        if int(r.get("w", 0)) <= 0 or int(r.get("h", 0)) <= 0:
+            invalid_roi_names.append(k)
+    if invalid_roi_names:
+        risk_flags.append("roi_geometry_invalid")
+        manual_reasons.append({
+            "code": "roi_geometry_invalid",
+            "message": "invalid ROI after clipping: " + ", ".join(invalid_roi_names)
+        })
     if roi_suggestion["scores"]["overall_confidence_score"] < 0.65:
         risk_flags.append("roi_low_score")
         manual_reasons.append({
             "code": "roi_low_confidence_score",
             "message": f"roi_suggestion overall_confidence_score low: {roi_suggestion['scores']['overall_confidence_score']}"
+        })
+
+    # high-confidence but likely wrong-direction risk
+    ex = direction_info.get("explainability", {})
+    high_conf = float(ex.get("final_confidence", 0.0)) >= 0.78
+    weak_profile = float(ex.get("main_subject_profile_confidence", 0.0)) < 0.55
+    low_topk = int(ex.get("voting_tracks", 0)) < max(2, int(ex.get("top_k_limit", 0) // 2) if int(ex.get("top_k_limit", 0)) > 0 else 2)
+    if high_conf and (weak_profile or low_topk):
+        risk_flags.append("direction_confident_but_unrepresentative")
+        manual_reasons.append({
+            "code": "direction_confident_but_unrepresentative",
+            "message": (
+                f"direction confidence appears high ({ex.get('final_confidence', 0)}), but top-K subject profile is weak "
+                f"(profile={ex.get('main_subject_profile_confidence', 0)}, voting_tracks={ex.get('voting_tracks', 0)})."
+            ),
         })
 
     calibration_report = {
@@ -1174,7 +1306,7 @@ def run_pipeline(config_path: Path) -> int:
         },
         "manual_review": {
             "recommended": bool(manual_reasons),
-            "priority": "high" if ("active_fallback" in risk_flags or "direction_unreliable" in risk_flags or "roi_low_confidence_geometry" in risk_flags or "roi_geometry_anomaly" in risk_flags or len(risk_flags) >= 2) else ("medium" if len(risk_flags) == 1 else "low"),
+            "priority": "high" if ("active_fallback" in risk_flags or "direction_unreliable" in risk_flags or "roi_low_confidence_geometry" in risk_flags or "roi_geometry_anomaly" in risk_flags or "roi_geometry_invalid" in risk_flags or "direction_confident_but_unrepresentative" in risk_flags or len(risk_flags) >= 2) else ("medium" if len(risk_flags) == 1 else "low"),
             "reasons": manual_reasons,
             "suggested_actions": [
                 "Confirm active_frame_roi left/right boundaries and black-border exclusion parameters.",
