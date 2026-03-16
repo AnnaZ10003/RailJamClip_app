@@ -28,6 +28,19 @@ calibration:
     sample_frames: 40
     black_col_threshold: 10
     min_non_black_ratio: 0.06
+    min_local_variance: 5.0
+    min_edge_density: 0.025
+    min_continuous_width_ratio: 0.40
+    edge_inset_px: 10
+    edge_inset_max_px: 24
+    left_quantile_conservative: 0.78
+    right_quantile_conservative: 0.22
+    center_offset_max_ratio: 0.10
+    symmetry_tolerance_ratio: 0.28
+    min_content_width_ratio: 0.45
+    max_content_width_ratio: 0.94
+    max_width_jitter_px: 32
+    frame_debug_limit: 80
     min_density_ratio: 0.015
     min_continuous_width_ratio: 0.40
     edge_inset_px: 10
