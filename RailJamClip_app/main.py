@@ -305,13 +305,16 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     auto_cfg = cfg.get("calibration", {}).get("active_frame_auto", {})
     sample_frames = int(auto_cfg.get("sample_frames", 40))
     black_th = float(auto_cfg.get("black_col_threshold", 10))
-    min_ratio = float(auto_cfg.get("min_content_width_ratio", 0.45))
+    min_ratio = float(auto_cfg.get("min_content_width_ratio", 0.34))
     max_ratio = float(auto_cfg.get("max_content_width_ratio", 0.94))
     max_jitter = float(auto_cfg.get("max_width_jitter_px", 32))
     min_non_black_ratio = float(auto_cfg.get("min_non_black_ratio", 0.06))
     min_local_variance = float(auto_cfg.get("min_local_variance", 5.0))
     min_edge_density = float(auto_cfg.get("min_edge_density", 0.025))
-    min_run_width_ratio = float(auto_cfg.get("min_continuous_width_ratio", 0.40))
+    min_run_width_ratio = float(auto_cfg.get("min_continuous_width_ratio", 0.34))
+    min_acceptable_narrow_width_ratio = float(auto_cfg.get("min_acceptable_narrow_width_ratio", 0.24))
+    min_stable_frames = int(auto_cfg.get("min_stable_frames", 8))
+    narrow_stable_max_jitter_px = float(auto_cfg.get("narrow_stable_max_jitter_px", 24))
     edge_inset_px = int(auto_cfg.get("edge_inset_px", 8))
     edge_inset_max_px = int(auto_cfg.get("edge_inset_max_px", 24))
     left_q = float(auto_cfg.get("left_quantile_conservative", 0.78))
@@ -320,9 +323,9 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     center_offset_max_ratio = float(auto_cfg.get("center_offset_max_ratio", 0.10))
     symmetry_tolerance_ratio = float(auto_cfg.get("symmetry_tolerance_ratio", 0.28))
 
-    dyn_w_ratio = float(auto_cfg.get("dynamic_default_width_ratio", 0.74))
-    dyn_side_ratio = float(auto_cfg.get("dynamic_default_side_margin_ratio", 0.12))
-    dyn_min_side_px = int(auto_cfg.get("dynamic_default_min_side_margin_px", 80))
+    dyn_w_ratio = float(auto_cfg.get("dynamic_default_width_ratio", 0.62))
+    dyn_side_ratio = float(auto_cfg.get("dynamic_default_side_margin_ratio", 0.18))
+    dyn_min_side_px = int(auto_cfg.get("dynamic_default_min_side_margin_px", 120))
     frame_debug_limit = int(auto_cfg.get("frame_debug_limit", 80))
 
     cap = cv2.VideoCapture(str(video_path))
@@ -331,6 +334,9 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     lefts: List[int] = []
     rights: List[int] = []
     widths: List[int] = []
+    narrow_lefts: List[int] = []
+    narrow_rights: List[int] = []
+    narrow_widths: List[int] = []
     sampled = 0
     frame_debug: List[Dict[str, Any]] = []
 
@@ -367,91 +373,106 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                 continue
             l, r = seg
             seg_w = r - l + 1
-            min_width_pass = seg_w >= int(width * min_run_width_ratio)
-            if not min_width_pass:
-                if len(frame_debug) < frame_debug_limit:
-                    frame_debug.append({
-                        "frame_index": idx,
-                        "valid": False,
-                        "left_candidate": int(l),
-                        "right_candidate": int(r),
-                        "segment_width": int(seg_w),
-                        "min_width_check_passed": False,
-                        "invalid_reason": "min_continuous_width_failed",
-                    })
-                continue
+            seg_ratio = seg_w / max(1, width)
 
             inset = min(edge_inset_px, edge_inset_max_px, max(0, seg_w // 8))
             l2, r2 = l + inset, r - inset
             if r2 <= l2:
                 if len(frame_debug) < frame_debug_limit:
-                    frame_debug.append({"frame_index": idx, "valid": False, "left_candidate": int(l), "right_candidate": int(r), "min_width_check_passed": True, "invalid_reason": "inset_overflow"})
+                    frame_debug.append({"frame_index": idx, "valid": False, "left_candidate": int(l), "right_candidate": int(r), "invalid_reason": "inset_overflow", "min_width_check_passed": False})
                 continue
 
-            lefts.append(l2)
-            rights.append(r2)
-            widths.append(r2 - l2 + 1)
+            refined_w = r2 - l2 + 1
+            min_width_pass = seg_ratio >= min_run_width_ratio
+            narrow_acceptable = (seg_ratio < min_run_width_ratio) and (seg_ratio >= min_acceptable_narrow_width_ratio)
+
+            if min_width_pass:
+                lefts.append(l2)
+                rights.append(r2)
+                widths.append(refined_w)
+            elif narrow_acceptable:
+                narrow_lefts.append(l2)
+                narrow_rights.append(r2)
+                narrow_widths.append(refined_w)
+
             if len(frame_debug) < frame_debug_limit:
                 frame_debug.append({
                     "frame_index": idx,
-                    "valid": True,
+                    "valid": bool(min_width_pass or narrow_acceptable),
                     "left_candidate": int(l2),
                     "right_candidate": int(r2),
-                    "segment_width": int(r2 - l2 + 1),
-                    "min_width_check_passed": True,
+                    "segment_width": int(refined_w),
+                    "segment_width_ratio": round(seg_ratio, 4),
+                    "min_width_check_passed": bool(min_width_pass),
+                    "narrow_acceptable": bool(narrow_acceptable),
+                    "invalid_reason": None if (min_width_pass or narrow_acceptable) else "min_continuous_width_failed",
                 })
     cap.release()
 
     warnings: List[str] = []
-    validity = "ok"
+    validity = "failed_no_valid_segments"
 
+    def _evaluate_roi(raw_roi: ROI) -> Tuple[str, Dict[str, float]]:
+        ratio = raw_roi[2] / max(1, width)
+        content_center = raw_roi[0] + raw_roi[2] / 2.0
+        center_offset_ratio = abs(content_center - (width / 2.0)) / max(1.0, width)
+        left_bar = raw_roi[0]
+        right_bar = max(0, width - (raw_roi[0] + raw_roi[2]))
+        symmetry_ratio = abs(left_bar - right_bar) / max(1.0, width)
+        stats = {
+            "center_offset_ratio": round(center_offset_ratio, 4),
+            "side_symmetry_ratio": round(symmetry_ratio, 4),
+            "final_width_ratio": round(ratio, 4),
+        }
+        if ratio < min_acceptable_narrow_width_ratio:
+            return "too_narrow", stats
+        if ratio > max_ratio:
+            return "too_wide", stats
+        if center_offset_ratio > center_offset_max_ratio:
+            return "off_center", stats
+        if symmetry_ratio > symmetry_tolerance_ratio:
+            return "asymmetric_side_bars", stats
+        return "ok", stats
+
+    detected_candidate_roi = None
+    rejected_candidate_info: Dict[str, Any] = {}
+    acceptance_mode = "fallback"
+    fallback_source: Optional[str] = None
+
+    # Priority 1: normal width accepted candidates
     if widths:
         left = int(_quantile([float(x) for x in lefts], left_q, median(lefts)))
         right = int(_quantile([float(x) for x in rights], right_q, median(rights)))
         raw = (left, 0, max(0, right - left + 1), height)
-        ratio = raw[2] / max(1, width)
+        detected_candidate_roi = raw
         jitter = float(max(widths) - min(widths)) if widths else 0.0
         pass_ratio = len(widths) / max(1, sampled)
-
-        # geometric priors
-        content_center = raw[0] + raw[2] / 2.0
-        center_offset_ratio = abs(content_center - (width / 2.0)) / max(1.0, width)
-        left_bar = raw[0]
-        right_bar = max(0, width - (raw[0] + raw[2]))
-        symmetry_ratio = abs(left_bar - right_bar) / max(1.0, width)
-
-        if ratio < min_ratio:
-            validity = "too_narrow"
-        elif ratio > max_ratio:
-            validity = "too_wide"
-        elif jitter > max_jitter:
-            validity = "unstable_jitter"
-        elif pass_ratio < 0.4:
-            validity = "low_valid_frame_ratio"
-        elif center_offset_ratio > center_offset_max_ratio:
-            validity = "off_center"
-        elif symmetry_ratio > symmetry_tolerance_ratio:
-            validity = "asymmetric_side_bars"
-
-        roi_raw = raw
-        roi_clipped, _ = _clip_roi_to_bounds(roi_raw, width, height)
-        if validity == "ok":
+        geo_status, geo_stats = _evaluate_roi(raw)
+        if jitter <= max_jitter and pass_ratio >= 0.3 and geo_status == "ok":
+            validity = "ok"
+            acceptance_mode = "direct"
+            roi_clipped, _ = _clip_roi_to_bounds(raw, width, height)
             return {
-                "roi_raw": _roi_to_cfg(roi_raw),
+                "roi_raw": _roi_to_cfg(raw),
                 "roi_clipped": _roi_to_cfg(roi_clipped),
                 "validity": validity,
+                "acceptance_mode": acceptance_mode,
                 "fallback_used": False,
-                "fallback_source": "none",
+                "fallback_source": None,
                 "warnings": warnings,
+                "detected_candidates": {
+                    "primary_candidate_roi": _roi_to_cfg(raw),
+                    "candidate_type": "normal_width",
+                },
+                "rejected_by_threshold": None,
+                "final_applied_roi": _roi_to_cfg(roi_clipped),
                 "stats": {
                     "sampled_frames": sampled,
                     "valid_frames": len(widths),
                     "valid_ratio": round(pass_ratio, 3),
                     "width_jitter_px": round(jitter, 2),
                     "edge_inset_px_applied": min(edge_inset_px, edge_inset_max_px),
-                    "center_offset_ratio": round(center_offset_ratio, 4),
-                    "side_symmetry_ratio": round(symmetry_ratio, 4),
-                    "final_width_ratio": round(ratio, 4),
+                    **geo_stats,
                 },
                 "sampling_debug": {
                     "frame_candidates": frame_debug,
@@ -459,13 +480,68 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                     "invalid_frame_indices": [int(x.get("frame_index", -1)) for x in frame_debug if not x.get("valid", False) and x.get("frame_index", -1) >= 0],
                 },
             }
-    else:
-        validity = "failed_no_valid_segments"
+        rejected_candidate_info = {
+            "reason": geo_status if geo_status != "ok" else ("unstable_jitter" if jitter > max_jitter else "low_valid_frame_ratio"),
+            "candidate_roi": _roi_to_cfg(raw),
+            "candidate_type": "normal_width",
+            "jitter_px": round(jitter, 2),
+            "valid_ratio": round(pass_ratio, 3),
+        }
 
+    # Priority 2: narrow but stable candidates accepted as success
+    if narrow_widths:
+        nleft = int(_quantile([float(x) for x in narrow_lefts], left_q, median(narrow_lefts)))
+        nright = int(_quantile([float(x) for x in narrow_rights], right_q, median(narrow_rights)))
+        nraw = (nleft, 0, max(0, nright - nleft + 1), height)
+        detected_candidate_roi = nraw
+        njitter = float(max(narrow_widths) - min(narrow_widths)) if narrow_widths else 0.0
+        nratio = len(narrow_widths) / max(1, sampled)
+        geo_status, geo_stats = _evaluate_roi(nraw)
+        if len(narrow_widths) >= min_stable_frames and njitter <= narrow_stable_max_jitter_px and nratio >= 0.2 and geo_status == "ok":
+            validity = "ok_narrow_stable"
+            acceptance_mode = "threshold_relaxed_accept"
+            roi_clipped, _ = _clip_roi_to_bounds(nraw, width, height)
+            warnings.append("accepted narrow but stable active-frame candidate via relaxed threshold")
+            return {
+                "roi_raw": _roi_to_cfg(nraw),
+                "roi_clipped": _roi_to_cfg(roi_clipped),
+                "validity": validity,
+                "acceptance_mode": acceptance_mode,
+                "fallback_used": False,
+                "fallback_source": None,
+                "warnings": warnings,
+                "detected_candidates": {
+                    "primary_candidate_roi": _roi_to_cfg(nraw),
+                    "candidate_type": "narrow_stable",
+                },
+                "rejected_by_threshold": rejected_candidate_info or None,
+                "final_applied_roi": _roi_to_cfg(roi_clipped),
+                "stats": {
+                    "sampled_frames": sampled,
+                    "valid_frames": len(narrow_widths),
+                    "valid_ratio": round(nratio, 3),
+                    "width_jitter_px": round(njitter, 2),
+                    "edge_inset_px_applied": min(edge_inset_px, edge_inset_max_px),
+                    **geo_stats,
+                    "narrow_stable_min_frames_required": min_stable_frames,
+                    "narrow_stable_max_jitter_px": narrow_stable_max_jitter_px,
+                },
+                "sampling_debug": {
+                    "frame_candidates": frame_debug,
+                    "invalid_frame_count": len([x for x in frame_debug if not x.get("valid", False)]),
+                    "invalid_frame_indices": [int(x.get("frame_index", -1)) for x in frame_debug if not x.get("valid", False) and x.get("frame_index", -1) >= 0],
+                },
+            }
+        rejected_candidate_info = {
+            "reason": geo_status if geo_status != "ok" else "narrow_candidate_not_stable_enough",
+            "candidate_roi": _roi_to_cfg(nraw),
+            "candidate_type": "narrow_stable",
+            "jitter_px": round(njitter, 2),
+            "valid_frames": len(narrow_widths),
+        }
+
+    # True fallback path only
     fallback_roi = None
-    fallback_source = "none"
-    fallback_reason = validity
-
     if template_match.get("matched") and template is not None:
         t_roi = template.get("rois", {}).get("active_frame_roi")
         if t_roi:
@@ -476,7 +552,7 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
         side_margin = max(dyn_min_side_px, int(width * dyn_side_ratio))
         target_w = int(width * dyn_w_ratio)
         if target_w <= 0 or target_w > width - 2:
-            target_w = int(width * 0.74)
+            target_w = int(width * 0.62)
         x = max(side_margin, (width - target_w) // 2)
         right_edge = min(width, width - side_margin)
         w = max(1, right_edge - x)
@@ -486,19 +562,31 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
         fallback_roi = (x, 0, max(1, w), height)
         fallback_source = "dynamic_conservative_default"
 
-    fallback_roi_clipped, _ = _clip_roi_to_bounds(fallback_roi, width, height)
+    roi_clipped, _ = _clip_roi_to_bounds(fallback_roi, width, height)
     warnings.append(f"active_frame_auto validity={validity}, fallback to {fallback_source}")
     return {
         "roi_raw": _roi_to_cfg(fallback_roi),
-        "roi_clipped": _roi_to_cfg(fallback_roi_clipped),
+        "roi_clipped": _roi_to_cfg(roi_clipped),
         "validity": validity,
+        "acceptance_mode": "fallback",
         "fallback_used": True,
         "fallback_source": fallback_source,
-        "fallback_reason": fallback_reason,
+        "fallback_reason": validity,
         "warnings": warnings,
+        "detected_candidates": {
+            "primary_candidate_roi": _roi_to_cfg(detected_candidate_roi) if detected_candidate_roi is not None else None,
+            "candidate_type": "normal_or_narrow",
+        },
+        "rejected_by_threshold": rejected_candidate_info or {
+            "reason": "failed_no_valid_segments",
+            "candidate_roi": None,
+            "candidate_type": "none",
+        },
+        "final_applied_roi": _roi_to_cfg(roi_clipped),
         "stats": {
             "sampled_frames": sampled,
             "valid_frames": len(widths),
+            "narrow_valid_frames": len(narrow_widths),
             "edge_inset_px_applied": min(edge_inset_px, edge_inset_max_px),
             "dynamic_default_policy": {
                 "dynamic_default_width_ratio": dyn_w_ratio,
@@ -512,7 +600,6 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
             "invalid_frame_indices": [int(x.get("frame_index", -1)) for x in frame_debug if not x.get("valid", False) and x.get("frame_index", -1) >= 0],
         },
     }
-
 def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], active_roi: ROI, core_roi: ROI, cfg: Dict[str, Any], template: Optional[Dict[str, Any]], active_result: Dict[str, Any]) -> Dict[str, Any]:
     mode = cfg.get("template", {}).get("direction_mode", "auto")
     default_dir = cfg.get("event", {}).get("direction", "left_to_right")
@@ -533,7 +620,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             },
         }
 
-    active_unstable = active_result.get("fallback_used", False) or active_result.get("validity") != "ok"
+    active_unstable = active_result.get("fallback_used", False) or active_result.get("validity") not in ("ok", "ok_narrow_stable")
     ax, ay, aw, ah = active_roi
     cx, _, cw, _ = core_roi
     total_tracks = len(track_features)
@@ -1069,6 +1156,7 @@ def run_pipeline(config_path: Path) -> int:
         "template_loading": template_loading,
         "active_frame_auto": {
             "enabled": bool(config.get("calibration", {}).get("active_frame_auto", {}).get("enabled", True)),
+            "final_applied_roi_is_authoritative": True,
             "result": active_result,
         },
         "direction": direction_info,

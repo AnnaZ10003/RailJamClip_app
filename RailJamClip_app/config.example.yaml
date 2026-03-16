@@ -30,7 +30,10 @@ calibration:
     min_non_black_ratio: 0.06
     min_local_variance: 5.0
     min_edge_density: 0.025
-    min_continuous_width_ratio: 0.40
+    min_continuous_width_ratio: 0.34
+    min_acceptable_narrow_width_ratio: 0.24
+    min_stable_frames: 8
+    narrow_stable_max_jitter_px: 24
     edge_inset_px: 10
     edge_inset_max_px: 24
     left_quantile_conservative: 0.78
@@ -42,9 +45,9 @@ calibration:
     max_width_jitter_px: 32
     frame_debug_limit: 80
     fallback_mode: "template_or_dynamic_conservative_default"
-    dynamic_default_width_ratio: 0.74
-    dynamic_default_side_margin_ratio: 0.12
-    dynamic_default_min_side_margin_px: 80
+    dynamic_default_width_ratio: 0.62
+    dynamic_default_side_margin_ratio: 0.18
+    dynamic_default_min_side_margin_px: 120
 
   roi_suggestion:
     enabled: true
