@@ -240,9 +240,14 @@ def _build_severity_counts(risk_flags: List[str]) -> Dict[str, int]:
         "roi_low_confidence_geometry",
         "roi_geometry_anomaly",
         "roi_geometry_invalid",
+        "direction_background_biased_event_windows",
         "direction_confident_but_event_profile_conflict",
     }
-    medium_codes = {"roi_low_score"}
+    medium_codes = {
+        "roi_low_score",
+        "roi_geometry_too_close_border",
+        "direction_topk_weak_foregroundness",
+    }
 
     counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for code in risk_flags:
@@ -259,8 +264,16 @@ def _build_severity_counts(risk_flags: List[str]) -> Dict[str, int]:
 
 def _build_priority_decision_trace(event_id: str, input_window: Dict[str, str], risk_flags: List[str]) -> Dict[str, Any]:
     severity_counts = _build_severity_counts(risk_flags)
+    hard_high = "direction_confident_but_event_profile_conflict" in risk_flags
 
     rules = [
+        {
+            "rule_id": "R_HARD_DIRECTION_PROFILE_CONFLICT",
+            "matched": hard_high,
+            "proposed_priority": "high",
+            "explanation": "hard high trigger: direction_confident_but_event_profile_conflict is present",
+            "decisive_evidence": {"risk_flag": "direction_confident_but_event_profile_conflict", "present": hard_high},
+        },
         {
             "rule_id": "R_HIGH_SEVERITY_PRESENT",
             "matched": severity_counts["high"] > 0,
@@ -284,7 +297,7 @@ def _build_priority_decision_trace(event_id: str, input_window: Dict[str, str], 
         },
         {
             "rule_id": "R_DEFAULT_LOW",
-            "matched": severity_counts["total"] == 0 or severity_counts["low"] >= 0,
+            "matched": severity_counts["total"] == 0,
             "proposed_priority": "low",
             "explanation": "no higher-priority rule matched",
             "decisive_evidence": {"severity_counts.total": severity_counts["total"]},
@@ -1468,61 +1481,92 @@ def run_pipeline(config_path: Path) -> int:
 
     manual_reasons: List[Dict[str, str]] = []
     risk_flags: List[str] = []
+
+    def _append_risk(flag: str, code: str, message: str) -> None:
+        if flag not in risk_flags:
+            risk_flags.append(flag)
+        manual_reasons.append({"code": code, "message": message})
+
     if active_result["fallback_used"]:
-        risk_flags.append("active_fallback")
-        manual_reasons.append({
-            "code": "active_frame_fallback",
-            "message": f"active_frame_auto fallback used: source={active_result['fallback_source']}, validity={active_result['validity']}"
-        })
-    if not bool(direction_info.get("reliable", False)):
-        risk_flags.append("direction_unreliable")
-        ex = direction_info.get("explainability", {})
-        manual_reasons.append({
-            "code": "direction_unreliable_or_fallback",
-            "message": (
+        _append_risk(
+            "active_fallback",
+            "ACTIVE_FRAME_FALLBACK",
+            f"active_frame_auto fallback used: source={active_result['fallback_source']}, validity={active_result['validity']}",
+        )
+
+    ex = direction_info.get("explainability", {})
+    direction_reliable = bool(direction_info.get("reliable", False))
+    if not direction_reliable:
+        _append_risk(
+            "direction_unreliable",
+            "DIRECTION_UNRELIABLE_OR_FALLBACK",
+            (
                 "direction not reliable; "
                 f"voting_tracks={ex.get('voting_tracks', 0)}, "
                 f"l2r={ex.get('left_to_right_score', 0)}, r2l={ex.get('right_to_left_score', 0)}, "
                 f"confidence={ex.get('final_confidence', 0)}, final_source={direction_info.get('final', {}).get('source', 'unknown')}"
-            )
-        })
+            ),
+        )
+
     if roi_suggestion.get("mode") != "directional_template":
-        risk_flags.append("roi_low_confidence_geometry")
-        manual_reasons.append({
-            "code": "roi_generated_under_low_confidence_geometry",
-            "message": f"roi_suggestion mode={roi_suggestion.get('mode')} due to unreliable direction/context"
-        })
+        _append_risk(
+            "roi_low_confidence_geometry",
+            "ROI_GENERATED_UNDER_LOW_CONFIDENCE_GEOMETRY",
+            f"roi_suggestion mode={roi_suggestion.get('mode')} due to unreliable direction/context",
+        )
+
     if roi_suggestion["geometry_flags"]:
-        risk_flags.append("roi_geometry_anomaly")
-        manual_reasons.append({
-            "code": "roi_geometry_anomaly",
-            "message": "roi_geometry anomalies: " + ", ".join(roi_suggestion["geometry_flags"])
-        })
+        _append_risk(
+            "roi_geometry_anomaly",
+            "ROI_GEOMETRY_ANOMALY",
+            "roi_geometry anomalies: " + ", ".join(roi_suggestion["geometry_flags"]),
+        )
 
     # ROI invalidity hard check (e.g., w=0/h=0)
-    invalid_roi_names = []
-    for k in ["entry_roi", "core_roi", "exit_roi", "tracking_roi"]:
+    invalid_roi_names: List[str] = []
+    roi_items = ["entry_roi", "core_roi", "exit_roi", "tracking_roi"]
+    for k in roi_items:
         r = roi_suggestion["result"].get(k, {})
         if int(r.get("w", 0)) <= 0 or int(r.get("h", 0)) <= 0:
             invalid_roi_names.append(k)
-    if invalid_roi_names:
-        risk_flags.append("roi_geometry_invalid")
-        manual_reasons.append({
-            "code": "roi_geometry_invalid",
-            "message": "invalid ROI after clipping: " + ", ".join(invalid_roi_names)
-        })
-    if roi_suggestion["scores"]["overall_confidence_score"] < 0.65:
-        risk_flags.append("roi_low_score")
-        manual_reasons.append({
-            "code": "roi_low_confidence_score",
-            "message": f"roi_suggestion overall_confidence_score low: {roi_suggestion['scores']['overall_confidence_score']}"
-        })
 
-    # high-confidence but likely wrong-direction risk
-    ex = direction_info.get("explainability", {})
-    high_conf = float(ex.get("final_confidence", 0.0)) >= 0.78
-    weak_profile = float(ex.get("main_subject_profile_confidence", 0.0)) < 0.55
-    low_topk = int(ex.get("voting_tracks", 0)) < max(2, int(ex.get("top_k_limit", 0) // 2) if int(ex.get("top_k_limit", 0)) > 0 else 2)
+    if invalid_roi_names:
+        _append_risk(
+            "roi_geometry_invalid",
+            "ROI_GEOMETRY_INVALID",
+            "invalid ROI after clipping: " + ", ".join(invalid_roi_names),
+        )
+
+    active = _parse_roi(clipped_roi_cfg, "active_frame_roi")
+    ax, ay, aw, ah = active
+    safe_border_margin_px = int(config.get("calibration", {}).get("roi_suggestion", {}).get("safe_border_margin_px", 24))
+    border_close_roi_names: List[str] = []
+    invalid_set = set(invalid_roi_names)
+    for k in roi_items:
+        if k in invalid_set:
+            continue
+        r = roi_suggestion["result"].get(k, {})
+        rx, ry, rw, rh = int(r.get("x", 0)), int(r.get("y", 0)), int(r.get("w", 0)), int(r.get("h", 0))
+        left_d = rx - ax
+        top_d = ry - ay
+        right_d = (ax + aw) - (rx + rw)
+        bottom_d = (ay + ah) - (ry + rh)
+        if min(left_d, top_d, right_d, bottom_d) <= safe_border_margin_px:
+            border_close_roi_names.append(k)
+    # invalid has higher priority than too-close-border for same ROI
+    if border_close_roi_names:
+        _append_risk(
+            "roi_geometry_too_close_border",
+            "ROI_GEOMETRY_TOO_CLOSE_BORDER",
+            f"ROI too close to active_frame border (margin<={safe_border_margin_px}px): " + ", ".join(border_close_roi_names),
+        )
+
+    if roi_suggestion["scores"]["overall_confidence_score"] < 0.65:
+        _append_risk(
+            "roi_low_score",
+            "ROI_LOW_CONFIDENCE_SCORE",
+            f"roi_suggestion overall_confidence_score low: {roi_suggestion['scores']['overall_confidence_score']}",
+        )
 
     # direction-vs-ROI geometry conflict check
     dval = direction_info.get("final", {}).get("value")
@@ -1532,16 +1576,71 @@ def run_pipeline(config_path: Path) -> int:
     x_cx = int(xr.get("x", 0)) + int(xr.get("w", 0)) / 2.0
     geometry_direction_conflict = (dval == "left_to_right" and e_cx > x_cx) or (dval == "right_to_left" and e_cx < x_cx)
 
-    if high_conf and (weak_profile or low_topk or geometry_direction_conflict):
-        risk_flags.append("direction_confident_but_event_profile_conflict")
-        manual_reasons.append({
-            "code": "direction_confident_but_event_profile_conflict",
-            "message": (
+    # window-level background-bias risk
+    selected_window_ids = {int(x) for x in ex.get("selected_window_ids", []) if isinstance(x, int) or isinstance(x, float)}
+    event_windows = ex.get("event_windows", []) if isinstance(ex.get("event_windows", []), list) else []
+    selected_windows = [w for w in event_windows if int(w.get("window_id", -1)) in selected_window_ids] if selected_window_ids else []
+    if not selected_windows and event_windows:
+        selected_windows = sorted(event_windows, key=lambda w: float(w.get("event_likeness_score", 0.0)), reverse=True)[:2]
+
+    crowded_selected = [w for w in selected_windows if bool(w.get("crowded_background_group", False))]
+    crowded_ratio = len(crowded_selected) / max(1, len(selected_windows))
+    avg_dominance = sum(float(w.get("dominance_score", 0.0)) for w in selected_windows) / max(1, len(selected_windows))
+    avg_candidate_count = sum(int(w.get("candidate_count", 0)) for w in selected_windows) / max(1, len(selected_windows))
+
+    background_biased_windows = direction_reliable and len(selected_windows) > 0 and (
+        crowded_ratio >= 0.5 and avg_dominance < 0.55 and avg_candidate_count >= 2.5
+    )
+    if background_biased_windows:
+        _append_risk(
+            "direction_background_biased_event_windows",
+            "DIRECTION_BACKGROUND_BIASED_EVENT_WINDOWS",
+            (
+                f"selected event windows appear background-biased: crowded_ratio={round(crowded_ratio,3)}, "
+                f"avg_dominance={round(avg_dominance,3)}, avg_candidate_count={round(avg_candidate_count,3)}"
+            ),
+        )
+
+    # track-level weak-foregroundness risk (distinct from window-level conditions)
+    topk_items = ex.get("top_k_selected", []) if isinstance(ex.get("top_k_selected", []), list) else []
+    weak_track_votes = 0
+    for item in topk_items:
+        feats = item.get("features", {}) if isinstance(item, dict) else {}
+        med_area = float(feats.get("median_area", 0.0))
+        med_h = float(feats.get("median_height", 0.0))
+        sparse = float(feats.get("sparse_score", 0.0))
+        core_dist = float(feats.get("core_distance_ratio", 0.0))
+        weak_conditions = [
+            med_area < 2200.0,
+            med_h < 110.0,
+            sparse > 0.7,
+            core_dist > 0.55,
+        ]
+        if sum(1 for x in weak_conditions if x) >= 2:
+            weak_track_votes += 1
+    weak_topk_ratio = weak_track_votes / max(1, len(topk_items))
+    weak_foreground_topk = direction_reliable and len(topk_items) > 0 and weak_topk_ratio >= 0.6
+    if weak_foreground_topk:
+        _append_risk(
+            "direction_topk_weak_foregroundness",
+            "DIRECTION_TOPK_WEAK_FOREGROUNDNESS",
+            f"top-k tracks show weak foregroundness: weak_ratio={round(weak_topk_ratio,3)}, weak_track_votes={weak_track_votes}, topk={len(topk_items)}",
+        )
+
+    high_conf = float(ex.get("final_confidence", 0.0)) >= 0.78
+    weak_profile = float(ex.get("main_subject_profile_confidence", 0.0)) < 0.55
+    low_topk = int(ex.get("voting_tracks", 0)) < max(2, int(ex.get("top_k_limit", 0) // 2) if int(ex.get("top_k_limit", 0)) > 0 else 2)
+
+    if high_conf and (weak_profile or low_topk or geometry_direction_conflict or background_biased_windows):
+        _append_risk(
+            "direction_confident_but_event_profile_conflict",
+            "DIRECTION_CONFIDENT_BUT_EVENT_PROFILE_CONFLICT",
+            (
                 f"direction confidence appears high ({ex.get('final_confidence', 0)}), but event profile/geometry conflicts "
                 f"(profile={ex.get('main_subject_profile_confidence', 0)}, voting_tracks={ex.get('voting_tracks', 0)}, "
-                f"geometry_conflict={geometry_direction_conflict})."
+                f"geometry_conflict={geometry_direction_conflict}, background_biased_windows={background_biased_windows})."
             ),
-        })
+        )
 
     calibration_run_id = f"calib_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     priority_decision_trace = _build_priority_decision_trace(
