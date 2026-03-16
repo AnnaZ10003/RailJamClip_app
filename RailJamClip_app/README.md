@@ -41,6 +41,8 @@ python main.py --config config.yaml
 ```
 
 ## 本轮输出
+> 注：当前版本重点放在自动标定可靠性（active_frame 与 direction 降级链路）修复。
+
 - `output/calibration_preview.jpg`：首帧标定图（整帧边界 + active/entry/core/exit + 坐标文字）
 - `output/metadata.json`：required 顶层结构（summary 四个必填计数存在）
 - `output/detections_debug.json`：检测+tracking 调试 JSON（若 `debug.export_detection_json=true`）

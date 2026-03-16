@@ -309,14 +309,21 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     max_ratio = float(auto_cfg.get("max_content_width_ratio", 0.94))
     max_jitter = float(auto_cfg.get("max_width_jitter_px", 32))
     min_non_black_ratio = float(auto_cfg.get("min_non_black_ratio", 0.06))
-    min_density_ratio = float(auto_cfg.get("min_density_ratio", 0.015))
+    min_local_variance = float(auto_cfg.get("min_local_variance", 5.0))
+    min_edge_density = float(auto_cfg.get("min_edge_density", 0.025))
     min_run_width_ratio = float(auto_cfg.get("min_continuous_width_ratio", 0.40))
     edge_inset_px = int(auto_cfg.get("edge_inset_px", 8))
     edge_inset_max_px = int(auto_cfg.get("edge_inset_max_px", 24))
+    left_q = float(auto_cfg.get("left_quantile_conservative", 0.78))
+    right_q = float(auto_cfg.get("right_quantile_conservative", 0.22))
+
+    center_offset_max_ratio = float(auto_cfg.get("center_offset_max_ratio", 0.10))
+    symmetry_tolerance_ratio = float(auto_cfg.get("symmetry_tolerance_ratio", 0.28))
 
     dyn_w_ratio = float(auto_cfg.get("dynamic_default_width_ratio", 0.74))
     dyn_side_ratio = float(auto_cfg.get("dynamic_default_side_margin_ratio", 0.12))
     dyn_min_side_px = int(auto_cfg.get("dynamic_default_min_side_margin_px", 80))
+    frame_debug_limit = int(auto_cfg.get("frame_debug_limit", 80))
 
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -325,6 +332,7 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     rights: List[int] = []
     widths: List[int] = []
     sampled = 0
+    frame_debug: List[Dict[str, Any]] = []
 
     if cap.isOpened() and total > 0:
         n = max(1, sample_frames)
@@ -333,44 +341,85 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if not ret:
+                if len(frame_debug) < frame_debug_limit:
+                    frame_debug.append({"frame_index": idx, "valid": False, "invalid_reason": "read_failed"})
                 continue
             sampled += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            col_mean = gray.mean(axis=0)
+
             non_black_ratio = (gray > black_th).mean(axis=0)
-            col_std = gray.std(axis=0)
-            dense_ratio = (col_std > 4.0).astype(float)
+            local_variance = gray.var(axis=0)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            grad_mag = cv2.magnitude(gx, gy)
+            edge_density = (grad_mag > 22.0).mean(axis=0)
+
             valid_flags = [
                 (non_black_ratio[j] >= min_non_black_ratio)
-                and ((col_mean[j] >= black_th + 3.0) or (dense_ratio[j] >= min_density_ratio))
+                and (local_variance[j] >= min_local_variance)
+                and (edge_density[j] >= min_edge_density)
                 for j in range(gray.shape[1])
             ]
             seg = _longest_true_segment(valid_flags)
             if seg is None:
+                if len(frame_debug) < frame_debug_limit:
+                    frame_debug.append({"frame_index": idx, "valid": False, "invalid_reason": "no_content_segment", "min_width_check_passed": False})
                 continue
             l, r = seg
-            if (r - l + 1) < int(width * min_run_width_ratio):
+            seg_w = r - l + 1
+            min_width_pass = seg_w >= int(width * min_run_width_ratio)
+            if not min_width_pass:
+                if len(frame_debug) < frame_debug_limit:
+                    frame_debug.append({
+                        "frame_index": idx,
+                        "valid": False,
+                        "left_candidate": int(l),
+                        "right_candidate": int(r),
+                        "segment_width": int(seg_w),
+                        "min_width_check_passed": False,
+                        "invalid_reason": "min_continuous_width_failed",
+                    })
                 continue
 
-            inset = min(edge_inset_px, edge_inset_max_px, max(0, (r - l + 1) // 8))
+            inset = min(edge_inset_px, edge_inset_max_px, max(0, seg_w // 8))
             l2, r2 = l + inset, r - inset
             if r2 <= l2:
+                if len(frame_debug) < frame_debug_limit:
+                    frame_debug.append({"frame_index": idx, "valid": False, "left_candidate": int(l), "right_candidate": int(r), "min_width_check_passed": True, "invalid_reason": "inset_overflow"})
                 continue
+
             lefts.append(l2)
             rights.append(r2)
             widths.append(r2 - l2 + 1)
+            if len(frame_debug) < frame_debug_limit:
+                frame_debug.append({
+                    "frame_index": idx,
+                    "valid": True,
+                    "left_candidate": int(l2),
+                    "right_candidate": int(r2),
+                    "segment_width": int(r2 - l2 + 1),
+                    "min_width_check_passed": True,
+                })
     cap.release()
 
     warnings: List[str] = []
     validity = "ok"
 
     if widths:
-        left = int(_quantile([float(x) for x in lefts], 0.75, median(lefts)))
-        right = int(_quantile([float(x) for x in rights], 0.25, median(rights)))
+        left = int(_quantile([float(x) for x in lefts], left_q, median(lefts)))
+        right = int(_quantile([float(x) for x in rights], right_q, median(rights)))
         raw = (left, 0, max(0, right - left + 1), height)
         ratio = raw[2] / max(1, width)
         jitter = float(max(widths) - min(widths)) if widths else 0.0
         pass_ratio = len(widths) / max(1, sampled)
+
+        # geometric priors
+        content_center = raw[0] + raw[2] / 2.0
+        center_offset_ratio = abs(content_center - (width / 2.0)) / max(1.0, width)
+        left_bar = raw[0]
+        right_bar = max(0, width - (raw[0] + raw[2]))
+        symmetry_ratio = abs(left_bar - right_bar) / max(1.0, width)
+
         if ratio < min_ratio:
             validity = "too_narrow"
         elif ratio > max_ratio:
@@ -379,6 +428,10 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
             validity = "unstable_jitter"
         elif pass_ratio < 0.4:
             validity = "low_valid_frame_ratio"
+        elif center_offset_ratio > center_offset_max_ratio:
+            validity = "off_center"
+        elif symmetry_ratio > symmetry_tolerance_ratio:
+            validity = "asymmetric_side_bars"
 
         roi_raw = raw
         roi_clipped, _ = _clip_roi_to_bounds(roi_raw, width, height)
@@ -396,6 +449,14 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                     "valid_ratio": round(pass_ratio, 3),
                     "width_jitter_px": round(jitter, 2),
                     "edge_inset_px_applied": min(edge_inset_px, edge_inset_max_px),
+                    "center_offset_ratio": round(center_offset_ratio, 4),
+                    "side_symmetry_ratio": round(symmetry_ratio, 4),
+                    "final_width_ratio": round(ratio, 4),
+                },
+                "sampling_debug": {
+                    "frame_candidates": frame_debug,
+                    "invalid_frame_count": len([x for x in frame_debug if not x.get("valid", False)]),
+                    "invalid_frame_indices": [int(x.get("frame_index", -1)) for x in frame_debug if not x.get("valid", False) and x.get("frame_index", -1) >= 0],
                 },
             }
     else:
@@ -444,6 +505,11 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                 "dynamic_default_side_margin_ratio": dyn_side_ratio,
                 "dynamic_default_min_side_margin_px": dyn_min_side_px,
             },
+        },
+        "sampling_debug": {
+            "frame_candidates": frame_debug,
+            "invalid_frame_count": len([x for x in frame_debug if not x.get("valid", False)]),
+            "invalid_frame_indices": [int(x.get("frame_index", -1)) for x in frame_debug if not x.get("valid", False) and x.get("frame_index", -1) >= 0],
         },
     }
 
@@ -549,6 +615,10 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             },
         }
 
+    status = "failed_insufficient_candidates" if len(candidates) < min_voting_tracks else ("unstable" if active_unstable else "failed")
+    if status == "failed_insufficient_candidates":
+        warnings.append("Direction auto failed: insufficient candidate tracks for voting.")
+
     t_dir = template.get("direction", {}).get("direction_value") if template is not None else None
     if t_dir in ("left_to_right", "right_to_left"):
         chain.append({"step": 2, "source": "template_direction", "result": "used", "value": t_dir})
@@ -563,7 +633,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
     return {
         "mode": "auto",
         "reliable": False,
-        "auto_inference": {"status": "unstable" if active_unstable else "failed", "value": None},
+        "auto_inference": {"status": status, "value": None},
         "final": {"value": final_value, "source": final_source},
         "fallback_chain": chain,
         "warnings": warnings,
