@@ -84,12 +84,23 @@ calibration:
     top_k: 4
     min_main_subject_score: 0.45
 
-    # S_sparse is medium/weak corrective term; core signals are size/motion/corridor
-    score_weight_size: 0.34
-    score_weight_motion: 0.31
-    score_weight_corridor: 0.24
-    score_weight_sparse: 0.07
-    score_weight_continuity: 0.04
+    # lower-half crossing hard gate
+    min_crossing_bottom_ratio: 0.60
+    min_crossing_quality: 0.45
+
+    # event-window selection
+    window_size_frames: 45
+    select_top_windows: 2
+    crowded_min_candidates: 4
+    crowded_small_ratio: 0.65
+    dominance_min_top1_score: 0.58
+
+    # S_sparse is medium/weak corrective term; core signals are size/motion/crossing
+    score_weight_size: 0.32
+    score_weight_motion: 0.30
+    score_weight_crossing: 0.24
+    score_weight_sparse: 0.08
+    score_weight_continuity: 0.06
 
 template:
   enabled: true

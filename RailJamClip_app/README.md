@@ -58,3 +58,38 @@ python main.py --config config.yaml
 - `tracking.min_motion_frames/min_motion_distance_px/direction_min_progress_px`：仅用于候选轨迹升级 confirmed 前的运动过滤（本版默认先放松）
 - `tracking.core_reacquire_max_frames/core_reacquire_max_dist_px`：仅对 confirmed 且 entered_core 的丢失轨迹保活重连
 - ROI 会在加载后自动裁剪到边界；若被裁剪或过小会输出 warning
+
+## Priority 决策 Trace（MVP 10 字段）定义规范
+
+> 目标：第一版仅覆盖最小可用的可解释性闭环，字段总量控制在 10 个。
+
+### 字段清单（仅 MVP）
+
+| 字段名 | 类型 | 必填 | 合法值/枚举 | 示例值 | 校验规则 |
+|---|---|---|---|---|---|
+| `trace_version` | `string` | 是 | 建议固定为 `"1.0"`（后续可迭代 `1.x`） | `"1.0"` | 必须匹配 `^\\d+\\.\\d+$`；第一版必须为 `"1.0"` |
+| `event_id` | `string` | 是 | 业务侧事件唯一标识；允许字母/数字/下划线/中划线 | `"evt_2026_03_16_000123"` | 长度 `1~128`；建议匹配 `^[A-Za-z0-9_-]+$`；同一数据域内唯一 |
+| `timestamp` | `string`（date-time） | 是 | ISO8601 UTC 时间戳 | `"2026-03-16T09:15:30Z"` | 必须为 RFC3339/ISO8601 格式；建议统一 UTC（`Z` 结尾） |
+| `input_window` | `object` | 是 | `start_ts`、`end_ts` 两个子字段（均为 date-time） | `{ "start_ts": "2026-03-16T09:14:30Z", "end_ts": "2026-03-16T09:15:30Z" }` | `start_ts <= end_ts`；时间窗不得为空 |
+| `source` | `object` | 是 | 至少包含 `engine`、`engine_version` | `{ "engine": "priority-rule-engine", "engine_version": "0.1.0" }` | `engine` 非空字符串；`engine_version` 建议 SemVer（如 `0.1.0`） |
+| `severity_counts` | `object` | 是 | 第一版固定键：`critical/high/medium/low/info/total`（均为整数） | `{ "critical":0, "high":3, "medium":6, "low":2, "info":0, "total":11 }` | 各值为 `>=0` 整数；`total = critical + high + medium + low + info` |
+| `triggered_rules` | `array<object>` | 是 | 每项建议包含：`rule_id`、`matched`、`proposed_priority`、`explanation` | `[{ "rule_id":"R_HIGH_COUNT_THRESHOLD", "matched":true, "proposed_priority":"high", "explanation":"high >= 3" }]` | 第一版建议仅记录命中规则；建议限制条数 `<= 5`（防止 payload 过重）；至少 1 条 |
+| `primary_rule` | `object` | 是 | 建议包含：`rule_id`、`decision_basis`、`decisive_evidence` | `{ "rule_id":"R_HIGH_COUNT_THRESHOLD", "decision_basis":"Matched highest-rank rule", "decisive_evidence": { "severity_counts.high":3, "threshold":3 } }` | `rule_id` 必须出现在 `triggered_rules.rule_id` 中；`decision_basis` 非空 |
+| `final_priority` | `string` | 是 | 枚举：`high` / `medium` / `low` | `"high"` | 严格枚举校验；禁止空值与大小写变体 |
+| `decision_path` | `string` | 是 | 人类可读单行路径 | `"R_HIGH_COUNT_THRESHOLD -> high"` | 长度建议 `1~256`；应包含主规则 `rule_id` 与 `final_priority` |
+
+### `triggered_rules` 轻量化建议（第一版）
+
+- 建议**只记录命中规则**，不记录全部候选规则，以降低存储与传输成本。
+- 建议设置最大条数（推荐 `<=5`）：
+  - 第一版可解释性只需看到“触发过哪些关键规则”。
+  - 条数过多会导致 trace 噪音增大，不利于业务方快速阅读。
+- 若命中规则超过上限，可仅保留前 N 条（按规则优先级或执行顺序），并在后续审计版再补全。
+
+### 为什么这 10 个字段足够第一版可解释性
+
+- `event_id/timestamp/input_window/source`：回答“是谁、何时、基于哪段输入、由谁判定”。
+- `severity_counts/triggered_rules/primary_rule`：回答“依据是什么，哪条规则拍板”。
+- `final_priority/decision_path`：回答“最终结论是什么、路径是什么”。
+
+以上正好覆盖“可追溯 + 可复核 + 可说明”的最小闭环，不引入审计级复杂度。

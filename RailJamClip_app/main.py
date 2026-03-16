@@ -218,6 +218,154 @@ def _detect_aspect_hint(width: int, height: int) -> str:
         return "landscape"
     return "near_square"
 
+MVP_TRACE_MAX_TRIGGERED_RULES = 5
+MVP_TRACE_FIELDS = {
+    "trace_version",
+    "event_id",
+    "timestamp",
+    "input_window",
+    "source",
+    "severity_counts",
+    "triggered_rules",
+    "primary_rule",
+    "final_priority",
+    "decision_path",
+}
+
+
+def _build_severity_counts(risk_flags: List[str]) -> Dict[str, int]:
+    high_codes = {
+        "active_fallback",
+        "direction_unreliable",
+        "roi_low_confidence_geometry",
+        "roi_geometry_anomaly",
+        "roi_geometry_invalid",
+        "direction_confident_but_event_profile_conflict",
+    }
+    medium_codes = {"roi_low_score"}
+
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for code in risk_flags:
+        if code in high_codes:
+            counts["high"] += 1
+        elif code in medium_codes:
+            counts["medium"] += 1
+        else:
+            counts["low"] += 1
+
+    counts["total"] = counts["critical"] + counts["high"] + counts["medium"] + counts["low"] + counts["info"]
+    return counts
+
+
+def _build_priority_decision_trace(event_id: str, input_window: Dict[str, str], risk_flags: List[str]) -> Dict[str, Any]:
+    severity_counts = _build_severity_counts(risk_flags)
+
+    rules = [
+        {
+            "rule_id": "R_HIGH_SEVERITY_PRESENT",
+            "matched": severity_counts["high"] > 0,
+            "proposed_priority": "high",
+            "explanation": f"high severity count = {severity_counts['high']} (>0)",
+            "decisive_evidence": {"severity_counts.high": severity_counts["high"], "threshold": 1},
+        },
+        {
+            "rule_id": "R_MULTI_SIGNAL_HIGH",
+            "matched": severity_counts["total"] >= 2,
+            "proposed_priority": "high",
+            "explanation": f"total signals = {severity_counts['total']} (>=2)",
+            "decisive_evidence": {"severity_counts.total": severity_counts["total"], "threshold": 2},
+        },
+        {
+            "rule_id": "R_MEDIUM_SEVERITY_PRESENT",
+            "matched": severity_counts["medium"] > 0,
+            "proposed_priority": "medium",
+            "explanation": f"medium severity count = {severity_counts['medium']} (>0)",
+            "decisive_evidence": {"severity_counts.medium": severity_counts["medium"], "threshold": 1},
+        },
+        {
+            "rule_id": "R_DEFAULT_LOW",
+            "matched": severity_counts["total"] == 0 or severity_counts["low"] >= 0,
+            "proposed_priority": "low",
+            "explanation": "no higher-priority rule matched",
+            "decisive_evidence": {"severity_counts.total": severity_counts["total"]},
+        },
+    ]
+
+    matched_rules = []
+    for r in rules:
+        if not r["matched"]:
+            continue
+        matched_rules.append({
+            "rule_id": r["rule_id"],
+            "matched": True,
+            "proposed_priority": r["proposed_priority"],
+            "explanation": r["explanation"],
+        })
+        if len(matched_rules) >= MVP_TRACE_MAX_TRIGGERED_RULES:
+            break
+
+    if not matched_rules:
+        matched_rules = [{
+            "rule_id": "R_DEFAULT_LOW",
+            "matched": True,
+            "proposed_priority": "low",
+            "explanation": "fallback default low",
+        }]
+
+    primary_rule_meta = next((r for r in rules if r["rule_id"] == matched_rules[0]["rule_id"]), rules[-1])
+    final_priority = matched_rules[0]["proposed_priority"]
+
+    trace = {
+        "trace_version": "1.0",
+        "event_id": event_id,
+        "timestamp": _utc_now_iso(),
+        "input_window": {
+            "start_ts": input_window["start_ts"],
+            "end_ts": input_window["end_ts"],
+        },
+        "source": {
+            "engine": "priority-rule-engine",
+            "engine_version": "0.1.0",
+        },
+        "severity_counts": severity_counts,
+        "triggered_rules": matched_rules,
+        "primary_rule": {
+            "rule_id": matched_rules[0]["rule_id"],
+            "decision_basis": f"Matched highest-priority rule: {matched_rules[0]['rule_id']}",
+            "decisive_evidence": primary_rule_meta["decisive_evidence"],
+        },
+        "final_priority": final_priority,
+        "decision_path": f"{matched_rules[0]['rule_id']} -> {final_priority}",
+    }
+
+    _validate_priority_trace_mvp(trace)
+    return trace
+
+
+def _validate_priority_trace_mvp(trace: Dict[str, Any]) -> None:
+    if set(trace.keys()) != MVP_TRACE_FIELDS:
+        raise ValueError("priority_decision_trace fields must strictly match MVP 10 fields")
+
+    source = trace.get("source", {})
+    if not isinstance(source, dict) or not source.get("engine") or not source.get("engine_version"):
+        raise ValueError("priority_decision_trace.source must include engine and engine_version")
+
+    sc = trace.get("severity_counts", {})
+    required_sc = ["critical", "high", "medium", "low", "info", "total"]
+    if any(k not in sc for k in required_sc):
+        raise ValueError("severity_counts missing required keys")
+    if sc["total"] != sc["critical"] + sc["high"] + sc["medium"] + sc["low"] + sc["info"]:
+        raise ValueError("severity_counts.total mismatch")
+
+    trules = trace.get("triggered_rules", [])
+    if not trules or len(trules) > MVP_TRACE_MAX_TRIGGERED_RULES:
+        raise ValueError("triggered_rules must contain 1..5 matched rules")
+    if any((not isinstance(r, dict)) or (r.get("matched") is not True) for r in trules):
+        raise ValueError("triggered_rules must only contain matched rules")
+
+    if trace.get("final_priority") not in {"high", "medium", "low"}:
+        raise ValueError("final_priority must be high/medium/low")
+
 
 def _load_template(template_path: Path) -> Optional[Dict[str, Any]]:
     if not template_path.exists():
@@ -627,6 +775,10 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "excluded_tracks": [],
                 "excluded_reason_counts": {},
                 "main_subject_profile_confidence": 1.0,
+                "event_windows": [],
+                "selected_event_window_ids": [],
+                "crowded_background_group_windows": [],
+                "crowded_suppressed_candidate_count": 0,
             },
         }
 
@@ -640,6 +792,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
     min_area = float(dir_cfg.get("min_bbox_area_px", 2000))
     min_height = float(dir_cfg.get("min_bbox_height_px", 58))
     min_bottom_ratio = float(dir_cfg.get("min_bottom_region_ratio", 0.58))
+    min_crossing_bottom_ratio = float(dir_cfg.get("min_crossing_bottom_ratio", 0.60))
     max_core_distance_ratio = float(dir_cfg.get("max_core_distance_ratio", 0.28))
     min_consistency = float(dir_cfg.get("min_direction_consistency", 0.70))
     min_voting_tracks = int(dir_cfg.get("min_voting_tracks", 2))
@@ -648,17 +801,24 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
     top_k = int(dir_cfg.get("top_k", 4))
     min_main_subject_score = float(dir_cfg.get("min_main_subject_score", 0.45))
 
-    w_size = float(dir_cfg.get("score_weight_size", 0.34))
-    w_motion = float(dir_cfg.get("score_weight_motion", 0.31))
-    w_corridor = float(dir_cfg.get("score_weight_corridor", 0.24))
-    w_sparse = float(dir_cfg.get("score_weight_sparse", 0.07))
-    w_cont = float(dir_cfg.get("score_weight_continuity", 0.04))
+    w_size = float(dir_cfg.get("score_weight_size", 0.32))
+    w_motion = float(dir_cfg.get("score_weight_motion", 0.30))
+    w_cross = float(dir_cfg.get("score_weight_crossing", 0.24))
+    w_sparse = float(dir_cfg.get("score_weight_sparse", 0.08))
+    w_cont = float(dir_cfg.get("score_weight_continuity", 0.06))
+
+    # window settings
+    window_size_frames = int(dir_cfg.get("window_size_frames", 45))
+    select_top_windows = int(dir_cfg.get("select_top_windows", 2))
+    crowded_min_candidates = int(dir_cfg.get("crowded_min_candidates", 4))
+    crowded_small_ratio = float(dir_cfg.get("crowded_small_ratio", 0.65))
+    dominance_min_top1_score = float(dir_cfg.get("dominance_min_top1_score", 0.58))
 
     reason_counts: Dict[str, int] = {}
     excluded_tracks: List[Dict[str, Any]] = []
     prefilter_candidates: List[Dict[str, Any]] = []
 
-    # determine crowd density map from centers
+    # determine coarse crowd density map from centers
     center_bins: Dict[int, int] = {}
     for feat in track_features.values():
         pts = feat.get("points", [])
@@ -673,9 +833,14 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
 
     for tid, feat in track_features.items():
         pts = feat.get("points", [])
+        frames = feat.get("frame_indices", [])
         if len(pts) < min_track_points:
             _exclude(tid, "short_track")
             continue
+        if len(frames) < min_track_points:
+            _exclude(tid, "short_track_frames")
+            continue
+
         areas = feat.get("areas", [])
         heights = feat.get("heights", [])
         if not areas or not heights:
@@ -684,20 +849,24 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
 
         med_area = float(median(areas))
         med_h = float(median(heights))
-        med_y = float(median([p[1] for p in pts]))
+        ys = [p[1] for p in pts]
+        xs = [p[0] for p in pts]
+        med_y = float(median(ys))
         delta_x = float(pts[-1][0] - pts[0][0])
+        delta_y = float(pts[-1][1] - pts[0][1])
         move_abs = abs(delta_x)
+
         deltas = [pts[i + 1][0] - pts[i][0] for i in range(len(pts) - 1)]
         if not deltas:
             _exclude(tid, "no_motion_series")
             continue
-
         pos = sum(1 for d in deltas if d > 0)
         neg = sum(1 for d in deltas if d < 0)
         consistency = max(pos, neg) / max(1, pos + neg)
-        core_dist_ratio = abs(float(median([p[0] for p in pts])) - (cx + cw / 2.0)) / max(1.0, aw)
 
-        # hard filters to remove background towing/crossing flows
+        core_dist_ratio = abs(float(median(xs)) - (cx + cw / 2.0)) / max(1.0, aw)
+
+        # hard filters
         if med_area < min_area:
             _exclude(tid, "small_bbox")
             continue
@@ -707,9 +876,6 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         if med_y < ay + ah * min_bottom_ratio:
             _exclude(tid, "upper_background")
             continue
-        if core_dist_ratio > max_core_distance_ratio:
-            _exclude(tid, "far_from_core_corridor")
-            continue
         if move_abs < min_move_px:
             _exclude(tid, "low_horizontal_motion")
             continue
@@ -717,31 +883,50 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             _exclude(tid, "low_direction_consistency")
             continue
 
+        # horizontal crossing quality (core proximity is embedded, not standalone)
+        dxdy_ratio = abs(delta_x) / max(1.0, abs(delta_y))
+        horiz_axis_score = min(1.0, dxdy_ratio / 3.0)
+        near_core_points = [p for p in pts if abs(p[0] - (cx + cw / 2.0)) <= max(20.0, cw * 0.8)]
+        near_core_count = len(near_core_points)
+        near_core_dx_quality = min(1.0, move_abs / max(1.0, min_move_px * 1.5)) if near_core_count > 0 else 0.0
+        crossing_bottom_gate = 1.0 if med_y >= ay + ah * min_crossing_bottom_ratio else 0.0
+        if crossing_bottom_gate == 0.0:
+            _exclude(tid, "crossing_not_in_lower_band")
+            continue
+        corridor_component = max(0.0, 1.0 - min(1.0, core_dist_ratio / max(1e-6, max_core_distance_ratio)))
+        crossing_quality = (0.40 * horiz_axis_score) + (0.35 * near_core_dx_quality) + (0.25 * corridor_component)
+        if crossing_quality < float(dir_cfg.get("min_crossing_quality", 0.45)):
+            _exclude(tid, "low_crossing_quality")
+            continue
+
         s_size = min(1.0, med_area / max(1.0, min_area * 2.0))
         s_motion = min(1.0, move_abs / max(1.0, min_move_px * 2.0))
-        s_corridor = max(0.0, 1.0 - min(1.0, core_dist_ratio / max(1e-6, max_core_distance_ratio)))
 
-        midx = int(median([p[0] for p in pts]) / max(1.0, aw * 0.12))
+        midx = int(median(xs) / max(1.0, aw * 0.12))
         local_crowd = center_bins.get(midx, 1)
         s_sparse = max(0.0, 1.0 - min(1.0, (local_crowd - 1) / 4.0))
 
         continuity = len(pts) / max(1.0, min_track_points * 2.0)
         s_cont = min(1.0, continuity)
 
-        main_subject_score = (w_size * s_size) + (w_motion * s_motion) + (w_corridor * s_corridor) + (w_sparse * s_sparse) + (w_cont * s_cont)
+        main_subject_score = (w_size * s_size) + (w_motion * s_motion) + (w_cross * crossing_quality) + (w_sparse * s_sparse) + (w_cont * s_cont)
 
         if main_subject_score < min_main_subject_score:
             _exclude(tid, "below_main_subject_score")
             continue
 
+        median_frame = int(median(frames))
+        window_id = int(median_frame // max(1, window_size_frames))
+
         prefilter_candidates.append({
             "track_id": tid,
+            "window_id": window_id,
             "delta_x": round(delta_x, 3),
             "main_subject_score": round(main_subject_score, 4),
             "features": {
                 "size_score": round(s_size, 3),
                 "motion_score": round(s_motion, 3),
-                "corridor_score": round(s_corridor, 3),
+                "crossing_quality": round(crossing_quality, 3),
                 "sparse_score": round(s_sparse, 3),
                 "continuity_score": round(s_cont, 3),
                 "median_area": round(med_area, 1),
@@ -749,20 +934,86 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "median_center_y": round(med_y, 1),
                 "core_distance_ratio": round(core_dist_ratio, 4),
                 "move_abs_px": round(move_abs, 2),
+                "near_core_point_count": near_core_count,
+                "dxdy_ratio": round(dxdy_ratio, 3),
             },
         })
 
-    prefilter_candidates.sort(key=lambda x: x["main_subject_score"], reverse=True)
-    voting_candidates = prefilter_candidates[: max(0, top_k)]
+    # event window scoring
+    windows: Dict[int, List[Dict[str, Any]]] = {}
+    for c in prefilter_candidates:
+        windows.setdefault(int(c["window_id"]), []).append(c)
 
-    l2r_score = sum(c["main_subject_score"] * abs(c["delta_x"]) for c in voting_candidates if c["delta_x"] > 0)
-    r2l_score = sum(c["main_subject_score"] * abs(c["delta_x"]) for c in voting_candidates if c["delta_x"] < 0)
+    event_windows: List[Dict[str, Any]] = []
+    crowded_window_ids: List[int] = []
+    crowded_suppressed_candidate_count = 0
+
+    for wid, items in windows.items():
+        items_sorted = sorted(items, key=lambda x: x["main_subject_score"], reverse=True)
+        top1 = items_sorted[0]
+        top2 = items_sorted[1] if len(items_sorted) > 1 else None
+
+        top1_score = float(top1["main_subject_score"])
+        top2_score = float(top2["main_subject_score"]) if top2 else 0.0
+        gap = max(0.0, top1_score - top2_score)
+        dominance = min(1.0, 0.55 * gap / max(1e-6, 1.0) + 0.45 * top1_score)
+        if top1_score < dominance_min_top1_score:
+            dominance *= 0.6
+
+        candidate_count = len(items_sorted)
+        smallish = sum(1 for x in items_sorted if float(x["features"].get("size_score", 0.0)) < 0.55)
+        small_ratio = smallish / max(1, candidate_count)
+        crowded = candidate_count >= crowded_min_candidates and small_ratio >= crowded_small_ratio
+        if crowded:
+            crowded_window_ids.append(wid)
+            crowded_suppressed_candidate_count += candidate_count
+
+        isolation = max(0.0, 1.0 - min(1.0, (candidate_count - 1) / 4.0))
+        window_crossing = sum(float(x["features"].get("crossing_quality", 0.0)) for x in items_sorted[:2]) / max(1, min(2, len(items_sorted)))
+        window_motion = sum(float(x["features"].get("motion_score", 0.0)) for x in items_sorted[:2]) / max(1, min(2, len(items_sorted)))
+
+        event_like = (0.40 * dominance) + (0.25 * isolation) + (0.20 * window_crossing) + (0.15 * window_motion)
+        if crowded:
+            event_like *= 0.45
+
+        event_windows.append({
+            "window_id": wid,
+            "candidate_count": candidate_count,
+            "top1_track_id": int(top1["track_id"]),
+            "top1_main_subject_score": round(top1_score, 4),
+            "top2_main_subject_score": round(top2_score, 4),
+            "dominance_score": round(dominance, 4),
+            "event_likeness_score": round(event_like, 4),
+            "crowded_background_group": crowded,
+            "small_target_ratio": round(small_ratio, 3),
+            "isolation_score": round(isolation, 3),
+            "window_crossing_score": round(window_crossing, 3),
+            "window_motion_score": round(window_motion, 3),
+            "candidate_track_ids": [int(x["track_id"]) for x in items_sorted],
+        })
+
+    # choose top event windows
+    event_windows.sort(key=lambda w: w["event_likeness_score"], reverse=True)
+    selected_windows = event_windows[: max(1, select_top_windows)]
+    selected_window_ids = [int(w["window_id"]) for w in selected_windows]
+
+    # apply window-likeness weighting and select global top-k from selected windows only
+    window_like_map = {int(w["window_id"]): float(w["event_likeness_score"]) for w in selected_windows}
+    selected_candidates = [c for c in prefilter_candidates if int(c["window_id"]) in window_like_map]
+    for c in selected_candidates:
+        c["event_likeness_score"] = round(window_like_map[int(c["window_id"])], 4)
+        c["combined_rank_score"] = round(float(c["main_subject_score"]) * float(c["event_likeness_score"]), 4)
+
+    selected_candidates.sort(key=lambda x: x["combined_rank_score"], reverse=True)
+    voting_candidates = selected_candidates[: max(0, top_k)]
+
+    l2r_score = sum(float(c["combined_rank_score"]) * abs(float(c["delta_x"])) for c in voting_candidates if float(c["delta_x"]) > 0)
+    r2l_score = sum(float(c["combined_rank_score"]) * abs(float(c["delta_x"])) for c in voting_candidates if float(c["delta_x"]) < 0)
     total_score = l2r_score + r2l_score
     confidence = max(l2r_score, r2l_score) / max(1e-6, total_score) if total_score > 0 else 0.0
 
-    # profile confidence: how much top-k looks like main-subject group
     if voting_candidates:
-        profile_conf = sum(c["main_subject_score"] for c in voting_candidates) / max(1, len(voting_candidates))
+        profile_conf = sum(float(c["main_subject_score"]) for c in voting_candidates) / max(1, len(voting_candidates))
     else:
         profile_conf = 0.0
 
@@ -796,6 +1047,10 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "excluded_tracks": excluded_tracks,
                 "excluded_reason_counts": reason_counts,
                 "main_subject_profile_confidence": round(profile_conf, 3),
+                "event_windows": event_windows,
+                "selected_event_window_ids": selected_window_ids,
+                "crowded_background_group_windows": crowded_window_ids,
+                "crowded_suppressed_candidate_count": crowded_suppressed_candidate_count,
             },
         }
 
@@ -834,6 +1089,10 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "excluded_tracks": excluded_tracks,
             "excluded_reason_counts": reason_counts,
             "main_subject_profile_confidence": round(profile_conf, 3),
+            "event_windows": event_windows,
+            "selected_event_window_ids": selected_window_ids,
+            "crowded_background_group_windows": crowded_window_ids,
+            "crowded_suppressed_candidate_count": crowded_suppressed_candidate_count,
         },
     }
 
@@ -1158,9 +1417,10 @@ def run_pipeline(config_path: Path) -> int:
         assigns = tracker_calib.update(filtered, fidx)
         frame_feats = _build_track_features(assigns)
         for tid, feat in frame_feats.items():
-            acc = track_features.setdefault(tid, {"points": [], "areas": [], "heights": [], "center_x": [], "center_y": []})
+            acc = track_features.setdefault(tid, {"points": [], "areas": [], "heights": [], "center_x": [], "center_y": [], "frame_indices": []})
             for k in ["points", "areas", "heights", "center_x", "center_y"]:
                 acc[k].extend(feat[k])
+            acc["frame_indices"].extend([fidx] * len(feat["points"]))
         fidx += 1
 
     # direction with fallback chain
@@ -1263,19 +1523,36 @@ def run_pipeline(config_path: Path) -> int:
     high_conf = float(ex.get("final_confidence", 0.0)) >= 0.78
     weak_profile = float(ex.get("main_subject_profile_confidence", 0.0)) < 0.55
     low_topk = int(ex.get("voting_tracks", 0)) < max(2, int(ex.get("top_k_limit", 0) // 2) if int(ex.get("top_k_limit", 0)) > 0 else 2)
-    if high_conf and (weak_profile or low_topk):
-        risk_flags.append("direction_confident_but_unrepresentative")
+
+    # direction-vs-ROI geometry conflict check
+    dval = direction_info.get("final", {}).get("value")
+    er = roi_suggestion["result"].get("entry_roi", {})
+    xr = roi_suggestion["result"].get("exit_roi", {})
+    e_cx = int(er.get("x", 0)) + int(er.get("w", 0)) / 2.0
+    x_cx = int(xr.get("x", 0)) + int(xr.get("w", 0)) / 2.0
+    geometry_direction_conflict = (dval == "left_to_right" and e_cx > x_cx) or (dval == "right_to_left" and e_cx < x_cx)
+
+    if high_conf and (weak_profile or low_topk or geometry_direction_conflict):
+        risk_flags.append("direction_confident_but_event_profile_conflict")
         manual_reasons.append({
-            "code": "direction_confident_but_unrepresentative",
+            "code": "direction_confident_but_event_profile_conflict",
             "message": (
-                f"direction confidence appears high ({ex.get('final_confidence', 0)}), but top-K subject profile is weak "
-                f"(profile={ex.get('main_subject_profile_confidence', 0)}, voting_tracks={ex.get('voting_tracks', 0)})."
+                f"direction confidence appears high ({ex.get('final_confidence', 0)}), but event profile/geometry conflicts "
+                f"(profile={ex.get('main_subject_profile_confidence', 0)}, voting_tracks={ex.get('voting_tracks', 0)}, "
+                f"geometry_conflict={geometry_direction_conflict})."
             ),
         })
 
+    calibration_run_id = f"calib_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    priority_decision_trace = _build_priority_decision_trace(
+        event_id=f"{calibration_run_id}:manual_review",
+        input_window={"start_ts": started_at, "end_ts": _utc_now_iso()},
+        risk_flags=risk_flags,
+    )
+
     calibration_report = {
         "schema_version": "1.0.0",
-        "run_id": f"calib_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        "run_id": calibration_run_id,
         "generated_at": _utc_now_iso(),
         "input_video": {
             "video_path": str(input_video_path),
@@ -1306,7 +1583,8 @@ def run_pipeline(config_path: Path) -> int:
         },
         "manual_review": {
             "recommended": bool(manual_reasons),
-            "priority": "high" if ("active_fallback" in risk_flags or "direction_unreliable" in risk_flags or "roi_low_confidence_geometry" in risk_flags or "roi_geometry_anomaly" in risk_flags or "roi_geometry_invalid" in risk_flags or "direction_confident_but_unrepresentative" in risk_flags or len(risk_flags) >= 2) else ("medium" if len(risk_flags) == 1 else "low"),
+            "priority": priority_decision_trace["final_priority"],
+            "priority_decision_trace": priority_decision_trace,
             "reasons": manual_reasons,
             "suggested_actions": [
                 "Confirm active_frame_roi left/right boundaries and black-border exclusion parameters.",
