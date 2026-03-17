@@ -264,15 +264,23 @@ def _build_severity_counts(risk_flags: List[str]) -> Dict[str, int]:
 
 def _build_priority_decision_trace(event_id: str, input_window: Dict[str, str], risk_flags: List[str]) -> Dict[str, Any]:
     severity_counts = _build_severity_counts(risk_flags)
-    hard_high = "direction_confident_but_event_profile_conflict" in risk_flags
+    hard_high_background = "direction_background_biased_event_windows" in risk_flags
+    hard_high_profile_conflict = "direction_confident_but_event_profile_conflict" in risk_flags
 
     rules = [
         {
+            "rule_id": "R_HARD_BACKGROUND_BIASED_WINDOWS",
+            "matched": hard_high_background,
+            "proposed_priority": "high",
+            "explanation": "hard high trigger: direction_background_biased_event_windows is present",
+            "decisive_evidence": {"risk_flag": "direction_background_biased_event_windows", "present": hard_high_background},
+        },
+        {
             "rule_id": "R_HARD_DIRECTION_PROFILE_CONFLICT",
-            "matched": hard_high,
+            "matched": hard_high_profile_conflict,
             "proposed_priority": "high",
             "explanation": "hard high trigger: direction_confident_but_event_profile_conflict is present",
-            "decisive_evidence": {"risk_flag": "direction_confident_but_event_profile_conflict", "present": hard_high},
+            "decisive_evidence": {"risk_flag": "direction_confident_but_event_profile_conflict", "present": hard_high_profile_conflict},
         },
         {
             "rule_id": "R_HIGH_SEVERITY_PRESENT",
@@ -829,6 +837,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
 
     reason_counts: Dict[str, int] = {}
     excluded_tracks: List[Dict[str, Any]] = []
+    excluded_quality_by_window: Dict[int, int] = {}
     prefilter_candidates: List[Dict[str, Any]] = []
 
     # determine coarse crowd density map from centers
@@ -840,24 +849,33 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         midx = int(median([p[0] for p in pts]) / max(1.0, aw * 0.12))
         center_bins[midx] = center_bins.get(midx, 0) + 1
 
-    def _exclude(tid: int, reason: str) -> None:
+    def _exclude(tid: int, reason: str, window_id: Optional[int] = None) -> None:
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
-        excluded_tracks.append({"track_id": tid, "reason": reason})
+        excluded_tracks.append({
+            "track_id": tid,
+            "reason": reason,
+            "window_id": int(window_id) if window_id is not None and int(window_id) >= 0 else None,
+            "filter_stage": "quality_gate",
+        })
+        if window_id is not None and int(window_id) >= 0:
+            wid = int(window_id)
+            excluded_quality_by_window[wid] = excluded_quality_by_window.get(wid, 0) + 1
 
     for tid, feat in track_features.items():
         pts = feat.get("points", [])
         frames = feat.get("frame_indices", [])
+        window_hint = int(median(frames) // max(1, window_size_frames)) if frames else -1
         if len(pts) < min_track_points:
-            _exclude(tid, "short_track")
+            _exclude(tid, "short_track", window_hint)
             continue
         if len(frames) < min_track_points:
-            _exclude(tid, "short_track_frames")
+            _exclude(tid, "short_track_frames", window_hint)
             continue
 
         areas = feat.get("areas", [])
         heights = feat.get("heights", [])
         if not areas or not heights:
-            _exclude(tid, "missing_geometry")
+            _exclude(tid, "missing_geometry", window_hint)
             continue
 
         med_area = float(median(areas))
@@ -871,7 +889,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
 
         deltas = [pts[i + 1][0] - pts[i][0] for i in range(len(pts) - 1)]
         if not deltas:
-            _exclude(tid, "no_motion_series")
+            _exclude(tid, "no_motion_series", window_hint)
             continue
         pos = sum(1 for d in deltas if d > 0)
         neg = sum(1 for d in deltas if d < 0)
@@ -881,19 +899,19 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
 
         # hard filters
         if med_area < min_area:
-            _exclude(tid, "small_bbox")
+            _exclude(tid, "small_bbox", window_hint)
             continue
         if med_h < min_height:
-            _exclude(tid, "small_height")
+            _exclude(tid, "small_height", window_hint)
             continue
         if med_y < ay + ah * min_bottom_ratio:
-            _exclude(tid, "upper_background")
+            _exclude(tid, "upper_background", window_hint)
             continue
         if move_abs < min_move_px:
-            _exclude(tid, "low_horizontal_motion")
+            _exclude(tid, "low_horizontal_motion", window_hint)
             continue
         if consistency < min_consistency:
-            _exclude(tid, "low_direction_consistency")
+            _exclude(tid, "low_direction_consistency", window_hint)
             continue
 
         # horizontal crossing quality (core proximity is embedded, not standalone)
@@ -904,12 +922,12 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         near_core_dx_quality = min(1.0, move_abs / max(1.0, min_move_px * 1.5)) if near_core_count > 0 else 0.0
         crossing_bottom_gate = 1.0 if med_y >= ay + ah * min_crossing_bottom_ratio else 0.0
         if crossing_bottom_gate == 0.0:
-            _exclude(tid, "crossing_not_in_lower_band")
+            _exclude(tid, "crossing_not_in_lower_band", window_hint)
             continue
         corridor_component = max(0.0, 1.0 - min(1.0, core_dist_ratio / max(1e-6, max_core_distance_ratio)))
         crossing_quality = (0.40 * horiz_axis_score) + (0.35 * near_core_dx_quality) + (0.25 * corridor_component)
         if crossing_quality < float(dir_cfg.get("min_crossing_quality", 0.45)):
-            _exclude(tid, "low_crossing_quality")
+            _exclude(tid, "low_crossing_quality", window_hint)
             continue
 
         s_size = min(1.0, med_area / max(1.0, min_area * 2.0))
@@ -925,7 +943,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         main_subject_score = (w_size * s_size) + (w_motion * s_motion) + (w_cross * crossing_quality) + (w_sparse * s_sparse) + (w_cont * s_cont)
 
         if main_subject_score < min_main_subject_score:
-            _exclude(tid, "below_main_subject_score")
+            _exclude(tid, "below_main_subject_score", window_hint)
             continue
 
         median_frame = int(median(frames))
@@ -952,7 +970,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             },
         })
 
-    # event window scoring
+    # event window scoring with context-aware crowd/background signals
     windows: Dict[int, List[Dict[str, Any]]] = {}
     for c in prefilter_candidates:
         windows.setdefault(int(c["window_id"]), []).append(c)
@@ -960,6 +978,10 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
     event_windows: List[Dict[str, Any]] = []
     crowded_window_ids: List[int] = []
     crowded_suppressed_candidate_count = 0
+
+    # internal-only split counters (quality gating vs background-context suppression)
+    quality_filtered_track_count = len(excluded_tracks)
+    background_context_suppressed_track_count = 0
 
     for wid, items in windows.items():
         items_sorted = sorted(items, key=lambda x: x["main_subject_score"], reverse=True)
@@ -976,10 +998,57 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         candidate_count = len(items_sorted)
         smallish = sum(1 for x in items_sorted if float(x["features"].get("size_score", 0.0)) < 0.55)
         small_ratio = smallish / max(1, candidate_count)
-        crowded = candidate_count >= crowded_min_candidates and small_ratio >= crowded_small_ratio
+
+        # context metrics: do not rely only on final candidate_count
+        quality_filtered_same_window = int(excluded_quality_by_window.get(int(wid), 0))
+        neighbor_prefilter_tracks = sum(len(windows.get(int(nwid), [])) for nwid in [wid - 1, wid + 1])
+        neighbor_quality_filtered_tracks = sum(int(excluded_quality_by_window.get(int(nwid), 0)) for nwid in [wid - 1, wid + 1])
+        prefilter_context_tracks = candidate_count + quality_filtered_same_window + neighbor_prefilter_tracks + neighbor_quality_filtered_tracks
+
+        top1_delta = float(top1.get("delta_x", 0.0))
+        top1_sign = 1 if top1_delta >= 0 else -1
+        top1_size_score = float(top1.get("features", {}).get("size_score", 0.0))
+
+        same_direction_group_count = 0
+        similar_scale_group_count = 0
+        for item in items_sorted:
+            dx = float(item.get("delta_x", 0.0))
+            sign = 1 if dx >= 0 else -1
+            if sign == top1_sign:
+                same_direction_group_count += 1
+            size_score = float(item.get("features", {}).get("size_score", 0.0))
+            if abs(size_score - top1_size_score) <= 0.18:
+                similar_scale_group_count += 1
+
+        areas_sorted = sorted(float(x.get("features", {}).get("median_area", 0.0)) for x in items_sorted)
+        top1_area = float(top1.get("features", {}).get("median_area", 0.0))
+        rank_desc = 1 + sum(1 for a in areas_sorted if a > top1_area)
+        top1_size_rank_proxy = 1.0 if candidate_count <= 1 else max(0.0, 1.0 - ((rank_desc - 1) / max(1, candidate_count - 1)))
+
+        suppression_pressure = max(0, prefilter_context_tracks - candidate_count)
+        crowd_density_score = min(1.0, max(0.0, (prefilter_context_tracks - 1) / 6.0))
+        suppression_score = min(1.0, suppression_pressure / 4.0)
+        group_flow_score = min(1.0, max(0.0, (same_direction_group_count - 1) / 3.0))
+        foreground_penalty = 1.0 - top1_size_rank_proxy
+        background_context_score = (
+            0.32 * crowd_density_score
+            + 0.28 * suppression_score
+            + 0.16 * min(1.0, small_ratio)
+            + 0.14 * group_flow_score
+            + 0.10 * foreground_penalty
+        )
+
+        crowded = (
+            background_context_score >= 0.58
+            or (prefilter_context_tracks >= crowded_min_candidates and small_ratio >= crowded_small_ratio)
+            or (suppression_pressure >= 3 and same_direction_group_count >= 2)
+        )
+
+        crowd_suppressed_tracks = max(0, candidate_count - 1) if crowded else 0
         if crowded:
             crowded_window_ids.append(wid)
-            crowded_suppressed_candidate_count += candidate_count
+            crowded_suppressed_candidate_count += crowd_suppressed_tracks
+            background_context_suppressed_track_count += crowd_suppressed_tracks
 
         isolation = max(0.0, 1.0 - min(1.0, (candidate_count - 1) / 4.0))
         window_crossing = sum(float(x["features"].get("crossing_quality", 0.0)) for x in items_sorted[:2]) / max(1, min(2, len(items_sorted)))
@@ -1003,6 +1072,13 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "window_crossing_score": round(window_crossing, 3),
             "window_motion_score": round(window_motion, 3),
             "candidate_track_ids": [int(x["track_id"]) for x in items_sorted],
+            "prefilter_context_tracks": int(prefilter_context_tracks),
+            "quality_filtered_tracks": int(quality_filtered_same_window + neighbor_quality_filtered_tracks),
+            "neighbor_prefilter_tracks": int(neighbor_prefilter_tracks),
+            "same_direction_group_count": int(same_direction_group_count),
+            "similar_scale_group_count": int(similar_scale_group_count),
+            "top1_size_rank_proxy": round(top1_size_rank_proxy, 3),
+            "crowd_suppressed_tracks": int(crowd_suppressed_tracks),
         })
 
     # choose top event windows
@@ -1064,6 +1140,8 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "selected_event_window_ids": selected_window_ids,
                 "crowded_background_group_windows": crowded_window_ids,
                 "crowded_suppressed_candidate_count": crowded_suppressed_candidate_count,
+                "quality_filtered_track_count": quality_filtered_track_count,
+                "background_context_suppressed_track_count": background_context_suppressed_track_count,
             },
         }
 
@@ -1106,6 +1184,8 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "selected_event_window_ids": selected_window_ids,
             "crowded_background_group_windows": crowded_window_ids,
             "crowded_suppressed_candidate_count": crowded_suppressed_candidate_count,
+            "quality_filtered_track_count": quality_filtered_track_count,
+            "background_context_suppressed_track_count": background_context_suppressed_track_count,
         },
     }
 
@@ -1576,28 +1656,47 @@ def run_pipeline(config_path: Path) -> int:
     x_cx = int(xr.get("x", 0)) + int(xr.get("w", 0)) / 2.0
     geometry_direction_conflict = (dval == "left_to_right" and e_cx > x_cx) or (dval == "right_to_left" and e_cx < x_cx)
 
-    # window-level background-bias risk
-    selected_window_ids = {int(x) for x in ex.get("selected_window_ids", []) if isinstance(x, int) or isinstance(x, float)}
+    # window-level background-bias risk (global context, not just final candidate_count)
+    selected_window_ids = {int(x) for x in ex.get("selected_event_window_ids", []) if isinstance(x, (int, float))}
     event_windows = ex.get("event_windows", []) if isinstance(ex.get("event_windows", []), list) else []
     selected_windows = [w for w in event_windows if int(w.get("window_id", -1)) in selected_window_ids] if selected_window_ids else []
     if not selected_windows and event_windows:
         selected_windows = sorted(event_windows, key=lambda w: float(w.get("event_likeness_score", 0.0)), reverse=True)[:2]
 
-    crowded_selected = [w for w in selected_windows if bool(w.get("crowded_background_group", False))]
-    crowded_ratio = len(crowded_selected) / max(1, len(selected_windows))
-    avg_dominance = sum(float(w.get("dominance_score", 0.0)) for w in selected_windows) / max(1, len(selected_windows))
-    avg_candidate_count = sum(int(w.get("candidate_count", 0)) for w in selected_windows) / max(1, len(selected_windows))
+    high_conf = float(ex.get("final_confidence", 0.0)) >= 0.78
+    background_context_hits = 0
+    strong_background_hit = False
+    for w in selected_windows:
+        prefilter_context_tracks = int(w.get("prefilter_context_tracks", w.get("candidate_count", 0)))
+        quality_filtered_tracks = int(w.get("quality_filtered_tracks", 0))
+        crowd_suppressed_tracks = int(w.get("crowd_suppressed_tracks", 0))
+        small_ratio = float(w.get("small_target_ratio", 0.0))
+        top1_size_rank_proxy = float(w.get("top1_size_rank_proxy", 1.0))
+        same_direction_group_count = int(w.get("same_direction_group_count", 0))
 
-    background_biased_windows = direction_reliable and len(selected_windows) > 0 and (
-        crowded_ratio >= 0.5 and avg_dominance < 0.55 and avg_candidate_count >= 2.5
+        weak_subjectness = top1_size_rank_proxy < 0.72
+        context_dense = prefilter_context_tracks >= 4
+        suppressed_heavy = (quality_filtered_tracks + crowd_suppressed_tracks) >= 3
+        flow_grouped = same_direction_group_count >= 2
+
+        hit = (context_dense and (suppressed_heavy or small_ratio >= 0.55)) or (flow_grouped and weak_subjectness and small_ratio >= 0.45)
+        if hit:
+            background_context_hits += 1
+        if prefilter_context_tracks >= 6 and (crowd_suppressed_tracks >= 1 or quality_filtered_tracks >= 3):
+            strong_background_hit = True
+
+    selected_count = len(selected_windows)
+    background_hit_ratio = background_context_hits / max(1, selected_count)
+    background_biased_windows = direction_reliable and selected_count > 0 and (
+        strong_background_hit or (high_conf and background_hit_ratio >= 0.5)
     )
     if background_biased_windows:
         _append_risk(
             "direction_background_biased_event_windows",
             "DIRECTION_BACKGROUND_BIASED_EVENT_WINDOWS",
             (
-                f"selected event windows appear background-biased: crowded_ratio={round(crowded_ratio,3)}, "
-                f"avg_dominance={round(avg_dominance,3)}, avg_candidate_count={round(avg_candidate_count,3)}"
+                f"selected windows show dense/suppressed background context: hit_ratio={round(background_hit_ratio,3)}, "
+                f"strong_hit={strong_background_hit}, selected_windows={selected_count}"
             ),
         )
 
@@ -1627,7 +1726,6 @@ def run_pipeline(config_path: Path) -> int:
             f"top-k tracks show weak foregroundness: weak_ratio={round(weak_topk_ratio,3)}, weak_track_votes={weak_track_votes}, topk={len(topk_items)}",
         )
 
-    high_conf = float(ex.get("final_confidence", 0.0)) >= 0.78
     weak_profile = float(ex.get("main_subject_profile_confidence", 0.0)) < 0.55
     low_topk = int(ex.get("voting_tracks", 0)) < max(2, int(ex.get("top_k_limit", 0) // 2) if int(ex.get("top_k_limit", 0)) > 0 else 2)
 
