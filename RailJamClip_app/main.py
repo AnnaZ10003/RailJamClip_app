@@ -1026,6 +1026,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         top1_size_rank_proxy = 1.0 if candidate_count <= 1 else max(0.0, 1.0 - ((rank_desc - 1) / max(1, candidate_count - 1)))
 
         suppression_pressure = max(0, prefilter_context_tracks - candidate_count)
+        suppression_ratio = suppression_pressure / max(1.0, float(prefilter_context_tracks))
         crowd_density_score = min(1.0, max(0.0, (prefilter_context_tracks - 1) / 6.0))
         suppression_score = min(1.0, suppression_pressure / 4.0)
         group_flow_score = min(1.0, max(0.0, (same_direction_group_count - 1) / 3.0))
@@ -1054,9 +1055,32 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         window_crossing = sum(float(x["features"].get("crossing_quality", 0.0)) for x in items_sorted[:2]) / max(1, min(2, len(items_sorted)))
         window_motion = sum(float(x["features"].get("motion_score", 0.0)) for x in items_sorted[:2]) / max(1, min(2, len(items_sorted)))
 
-        event_like = (0.40 * dominance) + (0.25 * isolation) + (0.20 * window_crossing) + (0.15 * window_motion)
+        event_like_raw = (0.40 * dominance) + (0.25 * isolation) + (0.20 * window_crossing) + (0.15 * window_motion)
         if crowded:
-            event_like *= 0.45
+            event_like_raw *= 0.45
+
+        subjectness_boost = max(
+            0.55,
+            min(
+                1.15,
+                (0.50 * top1_size_rank_proxy)
+                + (0.30 * min(1.0, window_crossing))
+                + (0.20 * min(1.0, top1_score)),
+            ),
+        )
+        window_rank_score = max(
+            0.02,
+            event_like_raw
+            * (1.0 - 0.65 * min(1.0, background_context_score))
+            * (1.0 - 0.35 * min(1.0, suppression_ratio))
+            * (0.90 + 0.10 * subjectness_boost),
+        )
+
+        suppress_for_selection = (
+            background_context_score >= 0.66
+            or suppression_ratio >= 0.62
+            or (crowded and background_context_score >= 0.58 and top1_size_rank_proxy < 0.72)
+        )
 
         event_windows.append({
             "window_id": wid,
@@ -1065,7 +1089,8 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "top1_main_subject_score": round(top1_score, 4),
             "top2_main_subject_score": round(top2_score, 4),
             "dominance_score": round(dominance, 4),
-            "event_likeness_score": round(event_like, 4),
+            "event_likeness_score": round(event_like_raw, 4),
+            "window_rank_score": round(window_rank_score, 4),
             "crowded_background_group": crowded,
             "small_target_ratio": round(small_ratio, 3),
             "isolation_score": round(isolation, 3),
@@ -1078,20 +1103,69 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "same_direction_group_count": int(same_direction_group_count),
             "similar_scale_group_count": int(similar_scale_group_count),
             "top1_size_rank_proxy": round(top1_size_rank_proxy, 3),
+            "background_context_score": round(background_context_score, 4),
+            "suppression_ratio": round(suppression_ratio, 4),
+            "subjectness_boost": round(subjectness_boost, 4),
             "crowd_suppressed_tracks": int(crowd_suppressed_tracks),
+            "suppress_for_selection": bool(suppress_for_selection),
         })
 
-    # choose top event windows
-    event_windows.sort(key=lambda w: w["event_likeness_score"], reverse=True)
-    selected_windows = event_windows[: max(1, select_top_windows)]
+    # choose top event windows: prefer non-suppressed windows first, and refill at most 1 suppressed window
+    normal_windows = [w for w in event_windows if not bool(w.get("suppress_for_selection", False))]
+    suppressed_windows = [w for w in event_windows if bool(w.get("suppress_for_selection", False))]
+    normal_windows.sort(key=lambda w: float(w.get("window_rank_score", w.get("event_likeness_score", 0.0))), reverse=True)
+    suppressed_windows.sort(key=lambda w: float(w.get("window_rank_score", w.get("event_likeness_score", 0.0))), reverse=True)
+
+    selected_windows = normal_windows[: max(1, select_top_windows)]
+    need_refill = max(0, max(1, select_top_windows) - len(selected_windows))
+    if need_refill > 0 and suppressed_windows:
+        selected_windows.extend(suppressed_windows[:1])
+    selected_windows.sort(key=lambda w: float(w.get("window_rank_score", w.get("event_likeness_score", 0.0))), reverse=True)
+    selected_windows = selected_windows[: max(1, select_top_windows)]
     selected_window_ids = [int(w["window_id"]) for w in selected_windows]
 
-    # apply window-likeness weighting and select global top-k from selected windows only
-    window_like_map = {int(w["window_id"]): float(w["event_likeness_score"]) for w in selected_windows}
+    # apply selected-window ranking and select global top-k
+    window_like_map = {int(w["window_id"]): float(w.get("window_rank_score", w.get("event_likeness_score", 0.0))) for w in selected_windows}
     selected_candidates = [c for c in prefilter_candidates if int(c["window_id"]) in window_like_map]
     for c in selected_candidates:
-        c["event_likeness_score"] = round(window_like_map[int(c["window_id"])], 4)
-        c["combined_rank_score"] = round(float(c["main_subject_score"]) * float(c["event_likeness_score"]), 4)
+        win_score = float(window_like_map[int(c["window_id"])] )
+        feats = c.get("features", {})
+        track_subjectness = max(
+            0.60,
+            min(
+                1.20,
+                (0.35 * float(feats.get("crossing_quality", 0.0)))
+                + (0.25 * float(feats.get("size_score", 0.0)))
+                + (0.20 * float(feats.get("continuity_score", 0.0)))
+                + (0.20 * max(0.0, 1.0 - float(feats.get("core_distance_ratio", 1.0)))),
+            ),
+        )
+        c["window_rank_score"] = round(win_score, 4)
+        c["subjectness_boost"] = round(track_subjectness, 4)
+        c["base_combined_score"] = round(float(c["main_subject_score"]) * win_score * track_subjectness, 4)
+
+    selected_candidates.sort(key=lambda x: x.get("base_combined_score", 0.0), reverse=True)
+
+    # lightweight anti-background direction consistency (no assumed target direction)
+    seed_n = max(2, min(len(selected_candidates), max(2, top_k)))
+    seed = selected_candidates[:seed_n]
+    seed_flow = sum(float(c.get("base_combined_score", 0.0)) * float(c.get("delta_x", 0.0)) for c in seed)
+    consensus_sign = 1 if seed_flow > 0 else (-1 if seed_flow < 0 else 0)
+
+    for c in selected_candidates:
+        final_score = float(c.get("base_combined_score", 0.0))
+        if consensus_sign != 0:
+            dx = float(c.get("delta_x", 0.0))
+            feats = c.get("features", {})
+            weak_opposite = (
+                (1 if dx >= 0 else -1) != consensus_sign
+                and abs(dx) < (min_move_px * 1.25)
+                and float(feats.get("crossing_quality", 0.0)) < 0.62
+                and float(feats.get("size_score", 0.0)) < 0.65
+            )
+            if weak_opposite:
+                final_score *= 0.82
+        c["combined_rank_score"] = round(final_score, 4)
 
     selected_candidates.sort(key=lambda x: x["combined_rank_score"], reverse=True)
     voting_candidates = selected_candidates[: max(0, top_k)]
