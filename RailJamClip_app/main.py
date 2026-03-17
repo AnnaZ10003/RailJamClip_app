@@ -808,14 +808,14 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
     cx, _, cw, _ = core_roi
     total_tracks = len(track_features)
 
-    min_track_points = int(dir_cfg.get("min_track_points", 5))
-    min_move_px = float(dir_cfg.get("min_move_px", 60))
+    min_track_points = int(dir_cfg.get("min_track_points", 4))
+    min_move_px = float(dir_cfg.get("min_move_px", 52))
     min_area = float(dir_cfg.get("min_bbox_area_px", 2000))
     min_height = float(dir_cfg.get("min_bbox_height_px", 58))
     min_bottom_ratio = float(dir_cfg.get("min_bottom_region_ratio", 0.58))
     min_crossing_bottom_ratio = float(dir_cfg.get("min_crossing_bottom_ratio", 0.60))
     max_core_distance_ratio = float(dir_cfg.get("max_core_distance_ratio", 0.28))
-    min_consistency = float(dir_cfg.get("min_direction_consistency", 0.70))
+    min_consistency = float(dir_cfg.get("min_direction_consistency", 0.66))
     min_voting_tracks = int(dir_cfg.get("min_voting_tracks", 2))
     min_final_confidence = float(dir_cfg.get("min_final_confidence", 0.68))
 
@@ -1180,6 +1180,23 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
     else:
         profile_conf = 0.0
 
+    gate_funnel = {
+        "total_tracks": total_tracks,
+        "after_length": total_tracks - reason_counts.get("short_track", 0) - reason_counts.get("short_track_frames", 0),
+        "after_size": total_tracks - reason_counts.get("short_track", 0) - reason_counts.get("short_track_frames", 0) - reason_counts.get("small_bbox", 0) - reason_counts.get("small_height", 0),
+        "after_motion": total_tracks - reason_counts.get("short_track", 0) - reason_counts.get("short_track_frames", 0) - reason_counts.get("small_bbox", 0) - reason_counts.get("small_height", 0) - reason_counts.get("low_horizontal_motion", 0),
+        "after_consistency": total_tracks - reason_counts.get("short_track", 0) - reason_counts.get("short_track_frames", 0) - reason_counts.get("small_bbox", 0) - reason_counts.get("small_height", 0) - reason_counts.get("low_horizontal_motion", 0) - reason_counts.get("low_direction_consistency", 0),
+        "after_crossing_quality": len(prefilter_candidates),
+        "voting_tracks": len(voting_candidates),
+        "top_excluded_reasons": sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:6],
+        "thresholds_applied": {
+            "min_track_points": min_track_points,
+            "min_move_px": min_move_px,
+            "min_direction_consistency": min_consistency,
+            "min_bbox_area_px": min_area,
+        },
+    }
+
     reliable = (not active_unstable) and len(voting_candidates) >= min_voting_tracks and total_score > 0 and confidence >= min_final_confidence
     chain = [{"step": 1, "source": "auto_inference", "result": "failed", "value": None}]
     warnings: List[str] = []
@@ -1209,6 +1226,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "top_k_selected": voting_candidates,
                 "excluded_tracks": excluded_tracks,
                 "excluded_reason_counts": reason_counts,
+                "gate_funnel": gate_funnel,
                 "main_subject_profile_confidence": round(profile_conf, 3),
                 "event_windows": event_windows,
                 "selected_event_window_ids": selected_window_ids,
@@ -1253,6 +1271,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "top_k_selected": voting_candidates,
             "excluded_tracks": excluded_tracks,
             "excluded_reason_counts": reason_counts,
+            "gate_funnel": gate_funnel,
             "main_subject_profile_confidence": round(profile_conf, 3),
             "event_windows": event_windows,
             "selected_event_window_ids": selected_window_ids,
@@ -1802,17 +1821,31 @@ def run_pipeline(config_path: Path) -> int:
 
     weak_profile = float(ex.get("main_subject_profile_confidence", 0.0)) < 0.55
     low_topk = int(ex.get("voting_tracks", 0)) < max(2, int(ex.get("top_k_limit", 0) // 2) if int(ex.get("top_k_limit", 0)) > 0 else 2)
+    auto_status = str(direction_info.get("auto_inference", {}).get("status", ""))
+    insufficient_evidence = (not direction_reliable) and (
+        auto_status == "failed_insufficient_candidates" or int(ex.get("voting_tracks", 0)) < min_voting_tracks
+    )
 
-    if high_conf and (weak_profile or low_topk or geometry_direction_conflict or background_biased_windows):
+    conflict_signal = (weak_profile or low_topk or geometry_direction_conflict or background_biased_windows)
+    if high_conf and conflict_signal and direction_reliable and not insufficient_evidence:
         _append_risk(
             "direction_confident_but_event_profile_conflict",
             "DIRECTION_CONFIDENT_BUT_EVENT_PROFILE_CONFLICT",
             (
-                f"direction confidence appears high ({ex.get('final_confidence', 0)}), but event profile/geometry conflicts "
-                f"(profile={ex.get('main_subject_profile_confidence', 0)}, voting_tracks={ex.get('voting_tracks', 0)}, "
-                f"geometry_conflict={geometry_direction_conflict}, background_biased_windows={background_biased_windows})."
+                f"direction confidence appears high ({ex.get('final_confidence', 0)}), and evidence is sufficient; "
+                f"event profile/geometry conflicts (profile={ex.get('main_subject_profile_confidence', 0)}, "
+                f"voting_tracks={ex.get('voting_tracks', 0)}, geometry_conflict={geometry_direction_conflict}, "
+                f"background_biased_windows={background_biased_windows})."
             ),
         )
+    elif high_conf and conflict_signal and insufficient_evidence:
+        manual_reasons.append({
+            "code": "DIRECTION_EVIDENCE_INSUFFICIENT_OR_UNRELIABLE",
+            "message": (
+                f"direction confidence value may be pseudo-high under insufficient evidence; "
+                f"status={auto_status}, voting_tracks={ex.get('voting_tracks', 0)}, min_voting_tracks={min_voting_tracks}."
+            ),
+        })
 
     calibration_run_id = f"calib_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     priority_decision_trace = _build_priority_decision_trace(
