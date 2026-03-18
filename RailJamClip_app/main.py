@@ -1822,8 +1822,12 @@ def run_pipeline(config_path: Path) -> int:
     weak_profile = float(ex.get("main_subject_profile_confidence", 0.0)) < 0.55
     low_topk = int(ex.get("voting_tracks", 0)) < max(2, int(ex.get("top_k_limit", 0) // 2) if int(ex.get("top_k_limit", 0)) > 0 else 2)
     auto_status = str(direction_info.get("auto_inference", {}).get("status", ""))
+    manual_review_min_voting_tracks = int(
+        ex.get("min_voting_tracks")
+        or config.get("calibration", {}).get("direction_auto", {}).get("min_voting_tracks", 2)
+    )
     insufficient_evidence = (not direction_reliable) and (
-        auto_status == "failed_insufficient_candidates" or int(ex.get("voting_tracks", 0)) < min_voting_tracks
+        auto_status == "failed_insufficient_candidates" or int(ex.get("voting_tracks", 0)) < manual_review_min_voting_tracks
     )
 
     conflict_signal = (weak_profile or low_topk or geometry_direction_conflict or background_biased_windows)
@@ -1843,7 +1847,7 @@ def run_pipeline(config_path: Path) -> int:
             "code": "DIRECTION_EVIDENCE_INSUFFICIENT_OR_UNRELIABLE",
             "message": (
                 f"direction confidence value may be pseudo-high under insufficient evidence; "
-                f"status={auto_status}, voting_tracks={ex.get('voting_tracks', 0)}, min_voting_tracks={min_voting_tracks}."
+                f"status={auto_status}, voting_tracks={ex.get('voting_tracks', 0)}, min_voting_tracks={manual_review_min_voting_tracks}."
             ),
         })
 
