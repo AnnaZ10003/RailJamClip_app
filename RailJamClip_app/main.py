@@ -125,6 +125,203 @@ def _warn_if_small_roi(name: str, roi: ROI, frame_w: int, frame_h: int, min_w: i
     return None
 
 
+def _safe_write_jsonl(rows: List[Dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            json.dump(row, f, ensure_ascii=False)
+            f.write("\n")
+
+
+def _build_ml_ready_exports(
+    calibration_report: Dict[str, Any],
+    config: Dict[str, Any],
+    direction_info: Dict[str, Any],
+    input_video_path: Path,
+) -> Dict[str, Any]:
+    run_id = str(calibration_report.get("run_id", "unknown_run"))
+    video_id = input_video_path.stem
+    ex = direction_info.get("explainability", {}) if isinstance(direction_info.get("explainability", {}), dict) else {}
+    manual_review = calibration_report.get("manual_review", {}) if isinstance(calibration_report.get("manual_review", {}), dict) else {}
+    gate_funnel = ex.get("gate_funnel", {}) if isinstance(ex.get("gate_funnel", {}), dict) else {}
+
+    auto_status = str(direction_info.get("auto_inference", {}).get("status", ""))
+    direction_reliable = bool(direction_info.get("reliable", False))
+    voting_tracks = int(ex.get("voting_tracks", 0) or 0)
+    top_k_limit = int(ex.get("top_k_limit", 0) or 0)
+    min_voting_tracks = int(
+        ex.get("min_voting_tracks")
+        or config.get("calibration", {}).get("direction_auto", {}).get("min_voting_tracks", 2)
+    )
+
+    if (not direction_reliable) and (auto_status == "failed_insufficient_candidates" or voting_tracks < min_voting_tracks):
+        direction_risk_semantic_class = "evidence_insufficient"
+        label_train_eligibility = "weak_only"
+        weak_label_direction_quality = "fallback_insufficient"
+    elif any(r.get("code") == "DIRECTION_CONFIDENT_BUT_EVENT_PROFILE_CONFLICT" for r in manual_review.get("reasons", [])):
+        direction_risk_semantic_class = "confident_conflict"
+        label_train_eligibility = "eligible"
+        weak_label_direction_quality = "sufficient_auto"
+    else:
+        direction_risk_semantic_class = "none"
+        label_train_eligibility = "eligible" if direction_reliable else "weak_only"
+        weak_label_direction_quality = "sufficient_auto" if direction_reliable else "fallback_other"
+
+    selected_window_ids = {int(x) for x in ex.get("selected_event_window_ids", []) if isinstance(x, (int, float))}
+    filtered_reason_by_track = {
+        int(x.get("track_id")): str(x.get("reason"))
+        for x in ex.get("excluded_tracks", [])
+        if isinstance(x, dict) and x.get("track_id") is not None
+    }
+
+    track_rows: List[Dict[str, Any]] = []
+    for item in ex.get("top_k_selected", []):
+        if not isinstance(item, dict):
+            continue
+        feats = item.get("features", {}) if isinstance(item.get("features", {}), dict) else {}
+        tid = int(item.get("track_id", -1))
+        row = {
+            "meta_schema_version": "1.0",
+            "run_id": run_id,
+            "video_id": video_id,
+            "window_id": int(item.get("window_id", -1)),
+            "track_id": tid,
+            "main_subject_score": float(item.get("main_subject_score", 0.0)),
+            "delta_x": float(item.get("delta_x", 0.0)),
+            "median_area": float(feats.get("median_area", 0.0)),
+            "median_height": float(feats.get("median_height", 0.0)),
+            "move_abs_px": float(feats.get("move_abs_px", 0.0)),
+            "crossing_quality": float(feats.get("crossing_quality", 0.0)),
+            "sparse_score": float(feats.get("sparse_score", 0.0)),
+            "continuity_score": float(feats.get("continuity_score", 0.0)),
+            "core_distance_ratio": float(feats.get("core_distance_ratio", 0.0)),
+            "size_score": float(feats.get("size_score", 0.0)),
+            "motion_score": float(feats.get("motion_score", 0.0)),
+            "window_rank_score": float(item.get("window_rank_score", 0.0)),
+            "subjectness_boost": float(item.get("subjectness_boost", 0.0)),
+            "base_combined_score": float(item.get("base_combined_score", 0.0)),
+            "combined_rank_score": float(item.get("combined_rank_score", 0.0)),
+            "is_topk_selected": True,
+            "weak_label_track_role": "main_candidate",
+            "filter_reason": None,
+            "review_status": "unreviewed",
+            "reviewer_id": None,
+            "reviewed_at": None,
+            "review_note": None,
+        }
+        if tid in filtered_reason_by_track:
+            row["weak_label_track_role"] = "filtered_out"
+            row["filter_reason"] = filtered_reason_by_track[tid]
+        track_rows.append(row)
+
+    window_rows: List[Dict[str, Any]] = []
+    for item in ex.get("event_windows", []):
+        if not isinstance(item, dict):
+            continue
+        wid = int(item.get("window_id", -1))
+        crowded = bool(item.get("crowded_background_group", False))
+        is_selected = wid in selected_window_ids
+        weak_role = "main_event_window" if is_selected else ("background_window" if crowded or bool(item.get("suppress_for_selection", False)) else "neutral_window")
+        window_rows.append({
+            "meta_schema_version": "1.0",
+            "run_id": run_id,
+            "video_id": video_id,
+            "window_id": wid,
+            "candidate_count": int(item.get("candidate_count", 0)),
+            "top1_track_id": int(item.get("top1_track_id", 0)),
+            "top1_main_subject_score": float(item.get("top1_main_subject_score", 0.0)),
+            "top2_main_subject_score": float(item.get("top2_main_subject_score", 0.0)),
+            "dominance_score": float(item.get("dominance_score", 0.0)),
+            "event_likeness_score": float(item.get("event_likeness_score", 0.0)),
+            "window_rank_score": float(item.get("window_rank_score", item.get("event_likeness_score", 0.0))),
+            "background_context_score": float(item.get("background_context_score", 0.0)),
+            "suppression_ratio": float(item.get("suppression_ratio", 0.0)),
+            "subjectness_boost": float(item.get("subjectness_boost", 0.0)),
+            "small_target_ratio": float(item.get("small_target_ratio", 0.0)),
+            "prefilter_context_tracks": int(item.get("prefilter_context_tracks", 0)),
+            "quality_filtered_tracks": int(item.get("quality_filtered_tracks", 0)),
+            "same_direction_group_count": int(item.get("same_direction_group_count", 0)),
+            "similar_scale_group_count": int(item.get("similar_scale_group_count", 0)),
+            "top1_size_rank_proxy": float(item.get("top1_size_rank_proxy", 0.0)),
+            "crowded_background_group": crowded,
+            "suppress_for_selection": bool(item.get("suppress_for_selection", False)),
+            "is_selected_event_window": is_selected,
+            "weak_label_window_role": weak_role,
+            "review_status": "unreviewed",
+            "reviewer_id": None,
+            "reviewed_at": None,
+            "review_note": None,
+        })
+
+    video_row = {
+        "meta_schema_version": "1.0",
+        "run_id": run_id,
+        "video_id": video_id,
+        "direction_reliable": direction_reliable,
+        "auto_inference_status": auto_status,
+        "direction_final_value": str(direction_info.get("final", {}).get("value", "left_to_right")),
+        "direction_final_source": str(direction_info.get("final", {}).get("source", "default_direction")),
+        "final_confidence": float(ex.get("final_confidence", 0.0)),
+        "voting_tracks": voting_tracks,
+        "top_k_limit": top_k_limit,
+        "gate_funnel": gate_funnel,
+        "manual_review_recommended": bool(manual_review.get("recommended", False)),
+        "manual_review_priority": str(manual_review.get("priority", "low")),
+        "manual_reason_codes": [str(x.get("code")) for x in manual_review.get("reasons", []) if isinstance(x, dict) and x.get("code")],
+        "direction_risk_semantic_class": direction_risk_semantic_class,
+        "label_train_eligibility": label_train_eligibility,
+        "weak_label_direction_quality": weak_label_direction_quality,
+        "review_status": "unreviewed",
+        "reviewer_id": None,
+        "reviewed_at": None,
+        "review_note": None,
+    }
+
+    return {
+        "track_rows": track_rows,
+        "window_rows": window_rows,
+        "video_rows": [video_row],
+    }
+
+
+def _export_ml_ready_artifacts(config: Dict[str, Any], calibration_report: Dict[str, Any], direction_info: Dict[str, Any], input_video_path: Path) -> None:
+    try:
+        output_root = Path(config.get("output", {}).get("root_dir", "output"))
+        ml_ready_dir = output_root / "ml_ready"
+        exports = _build_ml_ready_exports(calibration_report, config, direction_info, input_video_path)
+        track_path = ml_ready_dir / "track_samples.jsonl"
+        window_path = ml_ready_dir / "window_samples.jsonl"
+        video_path = ml_ready_dir / "video_samples.jsonl"
+        _safe_write_jsonl(exports["track_rows"], track_path)
+        _safe_write_jsonl(exports["window_rows"], window_path)
+        _safe_write_jsonl(exports["video_rows"], video_path)
+        manifest = {
+            "meta_schema_version": "1.0",
+            "run_id": str(calibration_report.get("run_id", "unknown_run")),
+            "exported_at": _utc_now_iso(),
+            "export_root": str(ml_ready_dir),
+            "files": {
+                "track_samples": {"path": str(track_path), "rows": len(exports["track_rows"]), "primary_key": ["run_id", "video_id", "window_id", "track_id"]},
+                "window_samples": {"path": str(window_path), "rows": len(exports["window_rows"]), "primary_key": ["run_id", "video_id", "window_id"]},
+                "video_samples": {"path": str(video_path), "rows": len(exports["video_rows"]), "primary_key": ["run_id", "video_id"]},
+            },
+            "label_policy": {
+                "weak_label_sources": ["rule_engine", "manual_review"],
+                "direction_risk_semantic_class_values": ["none", "confident_conflict", "evidence_insufficient"],
+                "label_train_eligibility_values": ["eligible", "weak_only"],
+            },
+            "compatibility": {
+                "non_intrusive_export": True,
+                "does_not_modify_calibration_report": True,
+                "does_not_modify_priority_trace_schema": True,
+            },
+        }
+        write_json(manifest, ml_ready_dir / "manifest.json")
+        print(f"[INFO] ML-ready artifacts exported: {ml_ready_dir}")
+    except Exception as exc:
+        print(f"[WARN] Failed to export ML-ready artifacts: {exc}")
+
+
 def _build_tracking_roi(stage_rois: List[ROI], margin_px: int, active_frame_roi: ROI) -> ROI:
     valid = [r for r in stage_rois if r[2] > 0 and r[3] > 0]
     if not valid:
@@ -1904,6 +2101,7 @@ def run_pipeline(config_path: Path) -> int:
 
     write_json(calibration_report, calibration_report_path)
     print(f"[INFO] Calibration report saved: {calibration_report_path}")
+    _export_ml_ready_artifacts(config, calibration_report, direction_info, input_video_path)
 
     # reset tracker for main run
     tracker = MinimalTracker(
