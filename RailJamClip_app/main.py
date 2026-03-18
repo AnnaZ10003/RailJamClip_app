@@ -133,6 +133,24 @@ def _safe_write_jsonl(rows: List[Dict[str, Any]], path: Path) -> None:
             f.write("\n")
 
 
+def _resolve_export_direction_explainability(
+    calibration_report: Dict[str, Any],
+    direction_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    report_direction = calibration_report.get("direction", {}) if isinstance(calibration_report.get("direction", {}), dict) else {}
+    report_ex = report_direction.get("explainability", {}) if isinstance(report_direction.get("explainability", {}), dict) else {}
+    direction_ex = direction_info.get("explainability", {}) if isinstance(direction_info.get("explainability", {}), dict) else {}
+
+    report_gate_funnel = report_ex.get("gate_funnel", {}) if isinstance(report_ex.get("gate_funnel", {}), dict) else {}
+    direction_gate_funnel = direction_ex.get("gate_funnel", {}) if isinstance(direction_ex.get("gate_funnel", {}), dict) else {}
+
+    if report_gate_funnel and direction_gate_funnel and report_gate_funnel != direction_gate_funnel:
+        print("[WARN] calibration_report.direction.explainability.gate_funnel differs from direction_info.explainability.gate_funnel; ml_ready export will use calibration_report as canonical source.")
+
+    return report_ex or direction_ex
+
+
+
 def _build_ml_ready_exports(
     calibration_report: Dict[str, Any],
     config: Dict[str, Any],
@@ -141,7 +159,7 @@ def _build_ml_ready_exports(
 ) -> Dict[str, Any]:
     run_id = str(calibration_report.get("run_id", "unknown_run"))
     video_id = input_video_path.stem
-    ex = direction_info.get("explainability", {}) if isinstance(direction_info.get("explainability", {}), dict) else {}
+    ex = _resolve_export_direction_explainability(calibration_report, direction_info)
     manual_review = calibration_report.get("manual_review", {}) if isinstance(calibration_report.get("manual_review", {}), dict) else {}
     gate_funnel = ex.get("gate_funnel", {}) if isinstance(ex.get("gate_funnel", {}), dict) else {}
 
@@ -301,9 +319,9 @@ def _export_ml_ready_artifacts(config: Dict[str, Any], calibration_report: Dict[
             "exported_at": _utc_now_iso(),
             "export_root": str(ml_ready_dir),
             "files": {
-                "track_samples": {"path": str(track_path), "rows": len(exports["track_rows"]), "primary_key": ["run_id", "video_id", "window_id", "track_id"]},
-                "window_samples": {"path": str(window_path), "rows": len(exports["window_rows"]), "primary_key": ["run_id", "video_id", "window_id"]},
-                "video_samples": {"path": str(video_path), "rows": len(exports["video_rows"]), "primary_key": ["run_id", "video_id"]},
+                "track_samples": {"path": "track_samples.jsonl", "rows": len(exports["track_rows"]), "primary_key": ["run_id", "video_id", "window_id", "track_id"]},
+                "window_samples": {"path": "window_samples.jsonl", "rows": len(exports["window_rows"]), "primary_key": ["run_id", "video_id", "window_id"]},
+                "video_samples": {"path": "video_samples.jsonl", "rows": len(exports["video_rows"]), "primary_key": ["run_id", "video_id"]},
             },
             "label_policy": {
                 "weak_label_sources": ["rule_engine", "manual_review"],

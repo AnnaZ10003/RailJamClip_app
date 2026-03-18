@@ -93,3 +93,9 @@ python main.py --config config.yaml
 - `final_priority/decision_path`：回答“最终结论是什么、路径是什么”。
 
 以上正好覆盖“可追溯 + 可复核 + 可说明”的最小闭环，不引入审计级复杂度。
+## 语义校验脚本位置
+- 语义校验脚本已放入 `RailJamClip_app/scripts/validate_semantics.py`。
+- `manifest.json` 中的 `files.*.path` 现在固定写为相对 `manifest.json` 所在目录的文件名：`track_samples.jsonl`、`window_samples.jsonl`、`video_samples.jsonl`。
+- 校验器兼容旧格式 `output/ml_ready/*.jsonl`，但旧格式仅作为兼容态读取，不再作为新 manifest 的标准写法。
+- 示例：`python RailJamClip_app/scripts/validate_semantics.py --manifest output/ml_ready/manifest.json`
+
