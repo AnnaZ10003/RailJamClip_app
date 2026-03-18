@@ -313,15 +313,18 @@ def _export_ml_ready_artifacts(config: Dict[str, Any], calibration_report: Dict[
         _safe_write_jsonl(exports["track_rows"], track_path)
         _safe_write_jsonl(exports["window_rows"], window_path)
         _safe_write_jsonl(exports["video_rows"], video_path)
+        manifest_track_path = track_path.name
+        manifest_window_path = window_path.name
+        manifest_video_path = video_path.name
         manifest = {
             "meta_schema_version": "1.0",
             "run_id": str(calibration_report.get("run_id", "unknown_run")),
             "exported_at": _utc_now_iso(),
             "export_root": str(ml_ready_dir),
             "files": {
-                "track_samples": {"path": "track_samples.jsonl", "rows": len(exports["track_rows"]), "primary_key": ["run_id", "video_id", "window_id", "track_id"]},
-                "window_samples": {"path": "window_samples.jsonl", "rows": len(exports["window_rows"]), "primary_key": ["run_id", "video_id", "window_id"]},
-                "video_samples": {"path": "video_samples.jsonl", "rows": len(exports["video_rows"]), "primary_key": ["run_id", "video_id"]},
+                "track_samples": {"path": manifest_track_path, "rows": len(exports["track_rows"]), "primary_key": ["run_id", "video_id", "window_id", "track_id"]},
+                "window_samples": {"path": manifest_window_path, "rows": len(exports["window_rows"]), "primary_key": ["run_id", "video_id", "window_id"]},
+                "video_samples": {"path": manifest_video_path, "rows": len(exports["video_rows"]), "primary_key": ["run_id", "video_id"]},
             },
             "label_policy": {
                 "weak_label_sources": ["rule_engine", "manual_review"],
