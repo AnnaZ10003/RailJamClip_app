@@ -732,6 +732,25 @@ def _is_corridor_aligned_high_track(med_y: float, active_roi: ROI, min_bottom_ra
     return True
 
 
+def _is_strong_subject_high_track(med_y: float, upper_background_threshold_y: float, active_roi: ROI, move_abs: float, min_move_px: float, consistency: float, min_consistency: float, horiz_axis_score: float, dxdy_ratio: float) -> bool:
+    _, _, _, ah = active_roi
+    if med_y >= upper_background_threshold_y:
+        return False
+    upper_background_gap_px = upper_background_threshold_y - med_y
+    upper_background_risk_ratio = upper_background_gap_px / max(1.0, ah)
+    if upper_background_risk_ratio > 0.18:
+        return False
+    if move_abs < max(min_move_px * 2.0, min_move_px + 40.0):
+        return False
+    if consistency < max(min_consistency, 0.95):
+        return False
+    if horiz_axis_score < 0.5:
+        return False
+    if dxdy_ratio < 1.5:
+        return False
+    return True
+
+
 def _classify_active_frame_candidate(raw_roi: ROI, frame_width: int, min_acceptable_narrow_width_ratio: float, max_content_width_ratio: float, center_offset_max_ratio: float, symmetry_tolerance_ratio: float) -> Tuple[str, Dict[str, float]]:
     ratio = raw_roi[2] / max(1, frame_width)
     content_center = raw_roi[0] + raw_roi[2] / 2.0
@@ -1221,8 +1240,22 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         )
         upper_background_threshold_y = ay + ah * min_bottom_ratio
         crossing_lower_band_threshold_y = ay + ah * min_crossing_bottom_ratio
+        strong_subject_high_track_override = _is_strong_subject_high_track(
+            med_y,
+            upper_background_threshold_y,
+            active_roi,
+            move_abs,
+            min_move_px,
+            consistency,
+            min_consistency,
+            horiz_axis_score,
+            dxdy_ratio,
+        )
+        high_track_override = corridor_aligned_high_track or strong_subject_high_track_override
         near_core_dx_quality = min(1.0, move_abs / max(1.0, min_move_px * 1.5)) if near_core_count > 0 else 0.0
-        crossing_bottom_gate = 1.0 if med_y >= crossing_lower_band_threshold_y else (0.72 if corridor_aligned_high_track else 0.0)
+        crossing_bottom_gate = 1.0 if med_y >= crossing_lower_band_threshold_y else (0.78 if strong_subject_high_track_override else (0.72 if corridor_aligned_high_track else 0.0))
+        upper_background_gap_px = max(0.0, upper_background_threshold_y - med_y)
+        upper_background_risk_ratio = upper_background_gap_px / max(1.0, ah)
         prefilter_diag = {
             "med_y": round(med_y, 3),
             "upper_background_threshold_y": round(upper_background_threshold_y, 3),
@@ -1233,10 +1266,13 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "dxdy_ratio": round(dxdy_ratio, 4),
             "crossing_bottom_gate": round(crossing_bottom_gate, 3),
             "corridor_aligned_high_track": bool(corridor_aligned_high_track),
+            "strong_subject_high_track_override": bool(strong_subject_high_track_override),
+            "upper_background_gap_px": round(upper_background_gap_px, 3),
+            "upper_background_risk_ratio": round(upper_background_risk_ratio, 4),
             "move_abs": round(move_abs, 3),
             "consistency": round(consistency, 4),
         }
-        if med_y < upper_background_threshold_y and not corridor_aligned_high_track:
+        if med_y < upper_background_threshold_y and not high_track_override:
             _exclude(tid, "upper_background", window_hint, diagnostic=prefilter_diag)
             continue
         if crossing_bottom_gate == 0.0:
@@ -1287,6 +1323,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "move_abs_px": round(move_abs, 2),
                 "near_core_point_count": near_core_count,
                 "corridor_aligned_high_track": corridor_aligned_high_track,
+                "strong_subject_high_track_override": strong_subject_high_track_override,
                 "crossing_bottom_gate": round(crossing_bottom_gate, 3),
                 "dxdy_ratio": round(dxdy_ratio, 3),
             },
