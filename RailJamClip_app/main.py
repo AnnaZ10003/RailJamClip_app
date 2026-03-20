@@ -685,6 +685,40 @@ def _build_track_features(assignments: List[TrackAssignment]) -> Dict[int, Dict[
     return feats
 
 
+
+def _track_motion_summary(history: List[Tuple[int, BBox]], motion_min_frames: int, direction: str, direction_min_progress_px: float) -> Dict[str, float]:
+    if len(history) < motion_min_frames:
+        return {"enough_history": False, "dx": 0.0, "dy": 0.0, "dist": 0.0, "direction_ok": False}
+    window = history[-motion_min_frames:]
+    start_cx, start_cy = _bbox_center(window[0][1])
+    end_cx, end_cy = _bbox_center(window[-1][1])
+    dx = end_cx - start_cx
+    dy = end_cy - start_cy
+    dist = math.sqrt(dx * dx + dy * dy)
+    direction_ok = (direction == "left_to_right" and dx >= direction_min_progress_px) or (direction == "right_to_left" and dx <= -direction_min_progress_px)
+    return {"enough_history": True, "dx": dx, "dy": dy, "dist": dist, "direction_ok": direction_ok}
+
+
+
+def _select_calibration_candidate_track_ids(tracker: MinimalTracker, direction: str, min_track_frames: int, motion_min_frames: int, motion_min_distance_px: float, direction_min_progress_px: float) -> List[int]:
+    candidate_ids: List[int] = []
+    for tid, track in tracker.tracks.items():
+        if track.confirmed:
+            candidate_ids.append(tid)
+            continue
+        if track.hit_frames < min_track_frames:
+            continue
+        motion = _track_motion_summary(track.history, motion_min_frames, direction, direction_min_progress_px)
+        if not motion["enough_history"]:
+            continue
+        if motion["dist"] < motion_min_distance_px:
+            continue
+        if not motion["direction_ok"]:
+            continue
+        candidate_ids.append(tid)
+    return candidate_ids
+
+
 def _classify_active_frame_candidate(raw_roi: ROI, frame_width: int, min_acceptable_narrow_width_ratio: float, max_content_width_ratio: float, center_offset_max_ratio: float, symmetry_tolerance_ratio: float) -> Tuple[str, Dict[str, float]]:
     ratio = raw_roi[2] / max(1, frame_width)
     content_center = raw_roi[0] + raw_roi[2] / 2.0
@@ -1041,7 +1075,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             },
         }
 
-    active_unstable = active_result.get("fallback_used", False) or active_result.get("validity") not in ("ok", "ok_narrow_stable")
+    active_unstable = active_result.get("fallback_used", False) or active_result.get("validity") not in ("ok", "ok_narrow_stable", "ok_full_width_stable")
     ax, ay, aw, ah = active_roi
     cx, _, cw, _ = core_roi
     total_tracks = len(track_features)
@@ -1806,20 +1840,26 @@ def run_pipeline(config_path: Path) -> int:
     print("[INFO] YOLO 模型已加载")
 
     # short calibration suggestion pass
-    frame_step = int(detector_cfg.get("frame_step", 2))
+    frame_step = 1
     sample_seconds = int(config.get("calibration", {}).get("roi_suggestion", {}).get("sample_seconds", 20))
     calib_frames_limit = int(max(1, video_info.get("fps", 30.0) * sample_seconds))
 
     direction_seed = str(config.get("event", {}).get("direction", "left_to_right"))
+    calib_min_track_frames = min(int(tracking_cfg.get("min_track_frames", 6)), 4)
+    calib_motion_min_frames = min(int(tracking_cfg.get("min_motion_frames", 3)), 2)
+    calib_motion_min_distance_px = min(float(tracking_cfg.get("min_motion_distance_px", 10)), 8.0)
+    calib_direction_min_progress_px = min(float(tracking_cfg.get("direction_min_progress_px", 5)), 3.0)
+    calib_tracking_cfg = dict(tracking_cfg)
+    calib_tracking_cfg["use_tracking_roi"] = False
     tracker_calib = MinimalTracker(
         iou_threshold=float(tracking_cfg.get("iou_threshold", 0.25)),
-        max_center_distance_px=float(tracking_cfg.get("max_center_distance_px", 80)),
-        max_lost_frames=int(tracking_cfg.get("max_lost_frames", 8)),
-        min_track_frames=int(tracking_cfg.get("min_track_frames", 6)),
-        motion_min_frames=int(tracking_cfg.get("min_motion_frames", 3)),
-        motion_min_distance_px=float(tracking_cfg.get("min_motion_distance_px", 10)),
+        max_center_distance_px=max(float(tracking_cfg.get("max_center_distance_px", 80)), 110.0),
+        max_lost_frames=max(int(tracking_cfg.get("max_lost_frames", 8)), 10),
+        min_track_frames=calib_min_track_frames,
+        motion_min_frames=calib_motion_min_frames,
+        motion_min_distance_px=calib_motion_min_distance_px,
         direction=direction_seed,
-        direction_min_progress_px=float(tracking_cfg.get("direction_min_progress_px", 5)),
+        direction_min_progress_px=calib_direction_min_progress_px,
         core_roi=_parse_roi(clipped_roi_cfg, "core_roi"),
         core_reacquire_max_frames=int(tracking_cfg.get("core_reacquire_max_frames", 10)),
         core_reacquire_max_dist_px=float(tracking_cfg.get("core_reacquire_max_dist_px", 120)),
@@ -1837,9 +1877,18 @@ def run_pipeline(config_path: Path) -> int:
             fidx += 1
             continue
         dets = detector.predict_frame(frame)
-        filtered = _filter_detections_for_tracking(dets, tracking_cfg, active_frame_roi, tracking_roi)
+        filtered = _filter_detections_for_tracking(dets, calib_tracking_cfg, active_frame_roi, tracking_roi)
         assigns = tracker_calib.update(filtered, fidx)
-        frame_feats = _build_track_features(assigns)
+        candidate_track_ids = set(_select_calibration_candidate_track_ids(
+            tracker_calib,
+            direction_seed,
+            calib_min_track_frames,
+            calib_motion_min_frames,
+            calib_motion_min_distance_px,
+            calib_direction_min_progress_px,
+        ))
+        candidate_assignments = [a for a in assigns if a.track_id in candidate_track_ids]
+        frame_feats = _build_track_features(candidate_assignments)
         for tid, feat in frame_feats.items():
             acc = track_features.setdefault(tid, {"points": [], "areas": [], "heights": [], "center_x": [], "center_y": [], "frame_indices": []})
             for k in ["points", "areas", "heights", "center_x", "center_y"]:
