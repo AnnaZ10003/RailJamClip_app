@@ -685,6 +685,30 @@ def _build_track_features(assignments: List[TrackAssignment]) -> Dict[int, Dict[
     return feats
 
 
+def _classify_active_frame_candidate(raw_roi: ROI, frame_width: int, min_acceptable_narrow_width_ratio: float, max_content_width_ratio: float, center_offset_max_ratio: float, symmetry_tolerance_ratio: float) -> Tuple[str, Dict[str, float]]:
+    ratio = raw_roi[2] / max(1, frame_width)
+    content_center = raw_roi[0] + raw_roi[2] / 2.0
+    center_offset_ratio = abs(content_center - (frame_width / 2.0)) / max(1.0, frame_width)
+    left_bar = raw_roi[0]
+    right_bar = max(0, frame_width - (raw_roi[0] + raw_roi[2]))
+    symmetry_ratio = abs(left_bar - right_bar) / max(1.0, frame_width)
+    stats = {
+        "center_offset_ratio": round(center_offset_ratio, 4),
+        "side_symmetry_ratio": round(symmetry_ratio, 4),
+        "final_width_ratio": round(ratio, 4),
+    }
+    if ratio < min_acceptable_narrow_width_ratio:
+        return "too_narrow", stats
+    if center_offset_ratio > center_offset_max_ratio:
+        return "off_center", stats
+    if symmetry_ratio > symmetry_tolerance_ratio:
+        return "asymmetric_side_bars", stats
+    if ratio > max_content_width_ratio:
+        return "near_full_width", stats
+    return "ok", stats
+
+
+
 def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg: Dict[str, Any], template: Optional[Dict[str, Any]], template_match: Dict[str, Any]) -> Dict[str, Any]:
     auto_cfg = cfg.get("calibration", {}).get("active_frame_auto", {})
     sample_frames = int(auto_cfg.get("sample_frames", 40))
@@ -796,28 +820,6 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
     warnings: List[str] = []
     validity = "failed_no_valid_segments"
 
-    def _evaluate_roi(raw_roi: ROI) -> Tuple[str, Dict[str, float]]:
-        ratio = raw_roi[2] / max(1, width)
-        content_center = raw_roi[0] + raw_roi[2] / 2.0
-        center_offset_ratio = abs(content_center - (width / 2.0)) / max(1.0, width)
-        left_bar = raw_roi[0]
-        right_bar = max(0, width - (raw_roi[0] + raw_roi[2]))
-        symmetry_ratio = abs(left_bar - right_bar) / max(1.0, width)
-        stats = {
-            "center_offset_ratio": round(center_offset_ratio, 4),
-            "side_symmetry_ratio": round(symmetry_ratio, 4),
-            "final_width_ratio": round(ratio, 4),
-        }
-        if ratio < min_acceptable_narrow_width_ratio:
-            return "too_narrow", stats
-        if ratio > max_ratio:
-            return "too_wide", stats
-        if center_offset_ratio > center_offset_max_ratio:
-            return "off_center", stats
-        if symmetry_ratio > symmetry_tolerance_ratio:
-            return "asymmetric_side_bars", stats
-        return "ok", stats
-
     detected_candidate_roi = None
     rejected_candidate_info: Dict[str, Any] = {}
     acceptance_mode = "fallback"
@@ -831,11 +833,21 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
         detected_candidate_roi = raw
         jitter = float(max(widths) - min(widths)) if widths else 0.0
         pass_ratio = len(widths) / max(1, sampled)
-        geo_status, geo_stats = _evaluate_roi(raw)
-        if jitter <= max_jitter and pass_ratio >= 0.3 and geo_status == "ok":
-            validity = "ok"
-            acceptance_mode = "direct"
+        geo_status, geo_stats = _classify_active_frame_candidate(
+            raw,
+            width,
+            min_acceptable_narrow_width_ratio,
+            max_ratio,
+            center_offset_max_ratio,
+            symmetry_tolerance_ratio,
+        )
+        near_full_width_accept = geo_status == "near_full_width" and jitter <= max_jitter and pass_ratio >= 0.3
+        if jitter <= max_jitter and pass_ratio >= 0.3 and geo_status in ("ok", "near_full_width"):
+            validity = "ok_full_width_stable" if near_full_width_accept else "ok"
+            acceptance_mode = "full_width_conditional_accept" if near_full_width_accept else "direct"
             roi_clipped, _ = _clip_roi_to_bounds(raw, width, height)
+            if near_full_width_accept:
+                warnings.append("accepted near-full-width active-frame candidate because it remained stable, centered, and symmetric across sampled frames")
             return {
                 "roi_raw": _roi_to_cfg(raw),
                 "roi_clipped": _roi_to_cfg(roi_clipped),
@@ -864,12 +876,14 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                     "invalid_frame_indices": [int(x.get("frame_index", -1)) for x in frame_debug if not x.get("valid", False) and x.get("frame_index", -1) >= 0],
                 },
             }
+        validity = "failed_geometry_rejected"
         rejected_candidate_info = {
-            "reason": geo_status if geo_status != "ok" else ("unstable_jitter" if jitter > max_jitter else "low_valid_frame_ratio"),
+            "reason": geo_status if geo_status not in ("ok", "near_full_width") else ("unstable_jitter" if jitter > max_jitter else "low_valid_frame_ratio"),
             "candidate_roi": _roi_to_cfg(raw),
             "candidate_type": "normal_width",
             "jitter_px": round(jitter, 2),
             "valid_ratio": round(pass_ratio, 3),
+            **geo_stats,
         }
 
     # Priority 2: narrow but stable candidates accepted as success
@@ -880,7 +894,14 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
         detected_candidate_roi = nraw
         njitter = float(max(narrow_widths) - min(narrow_widths)) if narrow_widths else 0.0
         nratio = len(narrow_widths) / max(1, sampled)
-        geo_status, geo_stats = _evaluate_roi(nraw)
+        geo_status, geo_stats = _classify_active_frame_candidate(
+            nraw,
+            width,
+            min_acceptable_narrow_width_ratio,
+            max_ratio,
+            center_offset_max_ratio,
+            symmetry_tolerance_ratio,
+        )
         if len(narrow_widths) >= min_stable_frames and njitter <= narrow_stable_max_jitter_px and nratio >= 0.2 and geo_status == "ok":
             validity = "ok_narrow_stable"
             acceptance_mode = "threshold_relaxed_accept"
@@ -916,12 +937,14 @@ def _auto_detect_active_frame_roi(video_path: Path, width: int, height: int, cfg
                     "invalid_frame_indices": [int(x.get("frame_index", -1)) for x in frame_debug if not x.get("valid", False) and x.get("frame_index", -1) >= 0],
                 },
             }
+        validity = "failed_geometry_rejected"
         rejected_candidate_info = {
             "reason": geo_status if geo_status != "ok" else "narrow_candidate_not_stable_enough",
             "candidate_roi": _roi_to_cfg(nraw),
             "candidate_type": "narrow_stable",
             "jitter_px": round(njitter, 2),
             "valid_frames": len(narrow_widths),
+            **geo_stats,
         }
 
     # True fallback path only
