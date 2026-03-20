@@ -1122,6 +1122,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
 
     reason_counts: Dict[str, int] = {}
     excluded_tracks: List[Dict[str, Any]] = []
+    prefilter_diagnostics: List[Dict[str, Any]] = []
     excluded_quality_by_window: Dict[int, int] = {}
     prefilter_candidates: List[Dict[str, Any]] = []
 
@@ -1134,17 +1135,25 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         midx = int(median([p[0] for p in pts]) / max(1.0, aw * 0.12))
         center_bins[midx] = center_bins.get(midx, 0) + 1
 
-    def _exclude(tid: int, reason: str, window_id: Optional[int] = None) -> None:
+    def _exclude(tid: int, reason: str, window_id: Optional[int] = None, diagnostic: Optional[Dict[str, Any]] = None) -> None:
+        normalized_window_id = int(window_id) if window_id is not None and int(window_id) >= 0 else None
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
         excluded_tracks.append({
             "track_id": tid,
             "reason": reason,
-            "window_id": int(window_id) if window_id is not None and int(window_id) >= 0 else None,
+            "window_id": normalized_window_id,
             "filter_stage": "quality_gate",
         })
-        if window_id is not None and int(window_id) >= 0:
-            wid = int(window_id)
-            excluded_quality_by_window[wid] = excluded_quality_by_window.get(wid, 0) + 1
+        if diagnostic is not None:
+            diag = {
+                "track_id": tid,
+                "reason": reason,
+                "window_id": normalized_window_id,
+            }
+            diag.update(diagnostic)
+            prefilter_diagnostics.append(diag)
+        if normalized_window_id is not None:
+            excluded_quality_by_window[normalized_window_id] = excluded_quality_by_window.get(normalized_window_id, 0) + 1
 
     for tid, feat in track_features.items():
         pts = feat.get("points", [])
@@ -1210,18 +1219,35 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             near_core_count,
             horiz_axis_score,
         )
-        if med_y < ay + ah * min_bottom_ratio and not corridor_aligned_high_track:
-            _exclude(tid, "upper_background", window_hint)
-            continue
+        upper_background_threshold_y = ay + ah * min_bottom_ratio
+        crossing_lower_band_threshold_y = ay + ah * min_crossing_bottom_ratio
         near_core_dx_quality = min(1.0, move_abs / max(1.0, min_move_px * 1.5)) if near_core_count > 0 else 0.0
-        crossing_bottom_gate = 1.0 if med_y >= ay + ah * min_crossing_bottom_ratio else (0.72 if corridor_aligned_high_track else 0.0)
+        crossing_bottom_gate = 1.0 if med_y >= crossing_lower_band_threshold_y else (0.72 if corridor_aligned_high_track else 0.0)
+        prefilter_diag = {
+            "med_y": round(med_y, 3),
+            "upper_background_threshold_y": round(upper_background_threshold_y, 3),
+            "crossing_lower_band_threshold_y": round(crossing_lower_band_threshold_y, 3),
+            "core_dist_ratio": round(core_dist_ratio, 4),
+            "near_core_count": int(near_core_count),
+            "horiz_axis_score": round(horiz_axis_score, 4),
+            "dxdy_ratio": round(dxdy_ratio, 4),
+            "crossing_bottom_gate": round(crossing_bottom_gate, 3),
+            "corridor_aligned_high_track": bool(corridor_aligned_high_track),
+            "move_abs": round(move_abs, 3),
+            "consistency": round(consistency, 4),
+        }
+        if med_y < upper_background_threshold_y and not corridor_aligned_high_track:
+            _exclude(tid, "upper_background", window_hint, diagnostic=prefilter_diag)
+            continue
         if crossing_bottom_gate == 0.0:
-            _exclude(tid, "crossing_not_in_lower_band", window_hint)
+            _exclude(tid, "crossing_not_in_lower_band", window_hint, diagnostic=prefilter_diag)
             continue
         corridor_component = max(0.0, 1.0 - min(1.0, core_dist_ratio / max(1e-6, max_core_distance_ratio)))
         crossing_quality = ((0.40 * horiz_axis_score) + (0.35 * near_core_dx_quality) + (0.25 * corridor_component)) * crossing_bottom_gate
         if crossing_quality < float(dir_cfg.get("min_crossing_quality", 0.45)):
-            _exclude(tid, "low_crossing_quality", window_hint)
+            diag_low_crossing = dict(prefilter_diag)
+            diag_low_crossing["crossing_quality"] = round(crossing_quality, 4)
+            _exclude(tid, "low_crossing_quality", window_hint, diagnostic=diag_low_crossing)
             continue
 
         s_size = min(1.0, med_area / max(1.0, min_area * 2.0))
@@ -1521,6 +1547,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "final_confidence": round(confidence, 3),
                 "top_k_selected": voting_candidates,
                 "excluded_tracks": excluded_tracks,
+                "prefilter_diagnostics": prefilter_diagnostics,
                 "excluded_reason_counts": reason_counts,
                 "gate_funnel": gate_funnel,
                 "main_subject_profile_confidence": round(profile_conf, 3),
@@ -1566,6 +1593,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             "final_confidence": round(min(confidence, 0.55) if active_unstable else confidence, 3),
             "top_k_selected": voting_candidates,
             "excluded_tracks": excluded_tracks,
+            "prefilter_diagnostics": prefilter_diagnostics,
             "excluded_reason_counts": reason_counts,
             "gate_funnel": gate_funnel,
             "main_subject_profile_confidence": round(profile_conf, 3),
