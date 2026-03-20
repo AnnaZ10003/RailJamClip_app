@@ -719,6 +719,19 @@ def _select_calibration_candidate_track_ids(tracker: MinimalTracker, direction: 
     return candidate_ids
 
 
+def _is_corridor_aligned_high_track(med_y: float, active_roi: ROI, min_bottom_ratio: float, core_dist_ratio: float, max_core_distance_ratio: float, near_core_count: int, horiz_axis_score: float) -> bool:
+    _, ay, _, ah = active_roi
+    if med_y >= ay + ah * min_bottom_ratio:
+        return False
+    if core_dist_ratio > max_core_distance_ratio:
+        return False
+    if near_core_count < 2:
+        return False
+    if horiz_axis_score < 0.35:
+        return False
+    return True
+
+
 def _classify_active_frame_candidate(raw_roi: ROI, frame_width: int, min_acceptable_narrow_width_ratio: float, max_content_width_ratio: float, center_offset_max_ratio: float, symmetry_tolerance_ratio: float) -> Tuple[str, Dict[str, float]]:
     ratio = raw_roi[2] / max(1, frame_width)
     content_center = raw_roi[0] + raw_roi[2] / 2.0
@@ -1176,9 +1189,6 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         if med_h < min_height:
             _exclude(tid, "small_height", window_hint)
             continue
-        if med_y < ay + ah * min_bottom_ratio:
-            _exclude(tid, "upper_background", window_hint)
-            continue
         if move_abs < min_move_px:
             _exclude(tid, "low_horizontal_motion", window_hint)
             continue
@@ -1191,13 +1201,25 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
         horiz_axis_score = min(1.0, dxdy_ratio / 3.0)
         near_core_points = [p for p in pts if abs(p[0] - (cx + cw / 2.0)) <= max(20.0, cw * 0.8)]
         near_core_count = len(near_core_points)
+        corridor_aligned_high_track = _is_corridor_aligned_high_track(
+            med_y,
+            active_roi,
+            min_bottom_ratio,
+            core_dist_ratio,
+            max_core_distance_ratio,
+            near_core_count,
+            horiz_axis_score,
+        )
+        if med_y < ay + ah * min_bottom_ratio and not corridor_aligned_high_track:
+            _exclude(tid, "upper_background", window_hint)
+            continue
         near_core_dx_quality = min(1.0, move_abs / max(1.0, min_move_px * 1.5)) if near_core_count > 0 else 0.0
-        crossing_bottom_gate = 1.0 if med_y >= ay + ah * min_crossing_bottom_ratio else 0.0
+        crossing_bottom_gate = 1.0 if med_y >= ay + ah * min_crossing_bottom_ratio else (0.72 if corridor_aligned_high_track else 0.0)
         if crossing_bottom_gate == 0.0:
             _exclude(tid, "crossing_not_in_lower_band", window_hint)
             continue
         corridor_component = max(0.0, 1.0 - min(1.0, core_dist_ratio / max(1e-6, max_core_distance_ratio)))
-        crossing_quality = (0.40 * horiz_axis_score) + (0.35 * near_core_dx_quality) + (0.25 * corridor_component)
+        crossing_quality = ((0.40 * horiz_axis_score) + (0.35 * near_core_dx_quality) + (0.25 * corridor_component)) * crossing_bottom_gate
         if crossing_quality < float(dir_cfg.get("min_crossing_quality", 0.45)):
             _exclude(tid, "low_crossing_quality", window_hint)
             continue
@@ -1238,6 +1260,8 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "core_distance_ratio": round(core_dist_ratio, 4),
                 "move_abs_px": round(move_abs, 2),
                 "near_core_point_count": near_core_count,
+                "corridor_aligned_high_track": corridor_aligned_high_track,
+                "crossing_bottom_gate": round(crossing_bottom_gate, 3),
                 "dxdy_ratio": round(dxdy_ratio, 3),
             },
         })
