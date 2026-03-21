@@ -87,6 +87,8 @@ calibration:
     # lower-half crossing hard gate
     min_crossing_bottom_ratio: 0.60
     min_crossing_quality: 0.45
+    min_strong_subject_high_track_crossing_quality: 0.45
+    strong_subject_high_track_crossing_gate_floor: 0.90
 
     # event-window selection
     window_size_frames: 45

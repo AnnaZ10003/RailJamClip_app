@@ -1279,10 +1279,39 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
             _exclude(tid, "crossing_not_in_lower_band", window_hint, diagnostic=prefilter_diag)
             continue
         corridor_component = max(0.0, 1.0 - min(1.0, core_dist_ratio / max(1e-6, max_core_distance_ratio)))
-        crossing_quality = ((0.40 * horiz_axis_score) + (0.35 * near_core_dx_quality) + (0.25 * corridor_component)) * crossing_bottom_gate
-        if crossing_quality < float(dir_cfg.get("min_crossing_quality", 0.45)):
+        crossing_components = {
+            "horiz_axis_score": horiz_axis_score,
+            "near_core_dx_quality": near_core_dx_quality,
+            "corridor_component": corridor_component,
+        }
+        crossing_quality_threshold = float(dir_cfg.get("min_crossing_quality", 0.45))
+        if strong_subject_high_track_override:
+            strong_motion_component = min(1.0, move_abs / max(1.0, min_move_px * 2.0))
+            strong_consistency_component = min(1.0, consistency / max(1e-6, max(min_consistency, 0.95)))
+            strong_track_core_component = max(corridor_component, near_core_dx_quality * 0.5)
+            effective_crossing_gate = max(crossing_bottom_gate, float(dir_cfg.get("strong_subject_high_track_crossing_gate_floor", 0.9)))
+            crossing_components.update({
+                "strong_motion_component": strong_motion_component,
+                "strong_consistency_component": strong_consistency_component,
+                "strong_track_core_component": strong_track_core_component,
+                "effective_crossing_gate": effective_crossing_gate,
+                "crossing_quality_mode": "strong_subject_high_track",
+            })
+            crossing_quality = (
+                (0.40 * horiz_axis_score)
+                + (0.30 * strong_motion_component)
+                + (0.20 * strong_consistency_component)
+                + (0.10 * strong_track_core_component)
+            ) * effective_crossing_gate
+            crossing_quality_threshold = float(dir_cfg.get("min_strong_subject_high_track_crossing_quality", crossing_quality_threshold))
+        else:
+            crossing_components["crossing_quality_mode"] = "default"
+            crossing_quality = ((0.40 * horiz_axis_score) + (0.35 * near_core_dx_quality) + (0.25 * corridor_component)) * crossing_bottom_gate
+        if crossing_quality < crossing_quality_threshold:
             diag_low_crossing = dict(prefilter_diag)
             diag_low_crossing["crossing_quality"] = round(crossing_quality, 4)
+            diag_low_crossing["crossing_quality_threshold"] = round(crossing_quality_threshold, 4)
+            diag_low_crossing.update({k: round(v, 4) if isinstance(v, float) else v for k, v in crossing_components.items()})
             _exclude(tid, "low_crossing_quality", window_hint, diagnostic=diag_low_crossing)
             continue
 
@@ -1326,6 +1355,7 @@ def _infer_direction_from_tracks(track_features: Dict[int, Dict[str, Any]], acti
                 "strong_subject_high_track_override": strong_subject_high_track_override,
                 "crossing_bottom_gate": round(crossing_bottom_gate, 3),
                 "dxdy_ratio": round(dxdy_ratio, 3),
+                "crossing_quality_mode": crossing_components["crossing_quality_mode"],
             },
         })
 
