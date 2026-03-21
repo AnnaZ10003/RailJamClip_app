@@ -43,6 +43,7 @@ class TrackAssignment:
     detection: Detection
     track_id: int
     confirmed: bool
+    preview_ready: bool
 
 
 class MinimalTracker:
@@ -151,7 +152,8 @@ class MinimalTracker:
             tid = assignments[det_idx]
             track = self.tracks.get(tid)
             confirmed = bool(track and track.confirmed)
-            results.append(TrackAssignment(detection=det, track_id=tid, confirmed=confirmed))
+            preview_ready = bool(track and self._is_preview_ready(track))
+            results.append(TrackAssignment(detection=det, track_id=tid, confirmed=confirmed, preview_ready=preview_ready))
         return results
 
     def _within_keepalive(self, track: Track) -> bool:
@@ -211,6 +213,14 @@ class MinimalTracker:
         if self.direction == "right_to_left" and dx > -self.direction_min_progress_px:
             return False
         return True
+
+    def _is_preview_ready(self, track: Track) -> bool:
+        if track.confirmed:
+            return True
+        preview_hit_frames = max(2, self.motion_min_frames)
+        if track.hit_frames < preview_hit_frames:
+            return False
+        return self._motion_ok(track)
 
     def _predict_bbox(self, track: Track) -> BBox:
         if len(track.history) < 2:

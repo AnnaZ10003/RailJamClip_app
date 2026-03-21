@@ -66,6 +66,7 @@ def _to_debug_item(frame_idx: int, assignments: List[TrackAssignment]) -> Dict[s
                 "confidence": a.detection.confidence,
                 "class_id": a.detection.class_id,
                 "confirmed": a.confirmed,
+                "preview_ready": a.preview_ready,
             }
             for a in assignments
         ],
@@ -375,9 +376,20 @@ def _draw_tracking_overlay(frame_bgr: Any, frame_idx: int, assignments: List[Tra
 
     for a in assignments:
         x1, y1, x2, y2 = map(int, a.detection.bbox_xyxy)
-        color = (0, 220, 0) if a.confirmed else (0, 80, 255)
+        if a.confirmed:
+            color = (0, 220, 0)
+            state = "confirmed"
+        elif a.preview_ready:
+            color = (0, 220, 220)
+            state = "preview_ready"
+        else:
+            color = (0, 80, 255)
+            state = "tentative"
         cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
-        tag = f"id={a.track_id} conf={'T' if a.confirmed else 'F'} p={a.detection.confidence:.2f}"
+        tag = (
+            f"id={a.track_id} conf={'T' if a.confirmed else 'F'} "
+            f"ready={'T' if a.preview_ready else 'F'} {state} p={a.detection.confidence:.2f}"
+        )
         cv2.putText(frame_bgr, tag, (x1, max(18, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     info = f"frame={frame_idx} persons={len(assignments)}"
